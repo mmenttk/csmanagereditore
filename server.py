@@ -246,6 +246,33 @@ class EditorRequestHandler(SimpleHTTPRequestHandler):
                     if path == "/api/bug-showcase":
                         return self._send_json(HTTPStatus.OK, SESSION.get_bug_showcase())
 
+                    if path in ("/api/strength-realism", "/api/data-science"):
+                        yr_s = _qs_str(qs, "year")
+                        ft_s = _qs_str(qs, "focus_team_id")
+                        return self._send_json(
+                            HTTPStatus.OK,
+                            SESSION.get_strength_realism(
+                                year=int(yr_s) if yr_s else None,
+                                focus_team_id=int(ft_s) if ft_s else None,
+                            ),
+                        )
+
+                    if path == "/api/manager-helper":
+                        tid_s = _qs_str(qs, "team_id")
+                        pid_s = _qs_str(qs, "target_player_id")
+                        role_s = _qs_str(qs, "role_preset", "match")
+                        return self._send_json(
+                            HTTPStatus.OK,
+                            SESSION.get_manager_helper(
+                                team_id=int(tid_s) if tid_s else None,
+                                target_player_id=int(pid_s) if pid_s else None,
+                                role_preset=role_s,
+                            ),
+                        )
+
+                    if path == "/api/god-mode/state":
+                        return self._send_json(HTTPStatus.OK, SESSION.get_god_mode_state())
+
                     if path == "/api/download":
                         fname, raw = SESSION.export_json_bytes()
                         safe_name = fname.replace('"', "").replace("\r", "").replace("\n", "")
@@ -339,6 +366,14 @@ class EditorRequestHandler(SimpleHTTPRequestHandler):
                         return self._send_json(
                             HTTPStatus.OK, SESSION.recalculate_ai_tactics(int(m.group(1)))
                         )
+
+                    if path == "/api/god-mode/apply":
+                        res = SESSION.run_god_mode(
+                            action=str(body.get("action", "")),
+                            params=body.get("params") or {},
+                            dry_run=bool(body.get("dryRun", False)),
+                        )
+                        return self._send_json(HTTPStatus.OK, res)
 
             elif method == "PUT":
                 body = self._read_json_body()

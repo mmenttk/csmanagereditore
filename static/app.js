@@ -40,6 +40,13 @@ const state = {
 
   // Bug Showcase
   showcaseData: null,
+
+  // Data Science & Manager Helper & God Mode
+  realismData: null,
+  realismSortKey: "worldRank",
+  realismSortDir: 1,
+  helperData: null,
+  godModeData: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -183,6 +190,9 @@ async function refreshSummaryOnly() {
 async function refreshAllViews() {
   state.statsData = null;
   state.showcaseData = null;
+  state.realismData = null;
+  state.helperData = null;
+  state.godModeData = null;
   const tRes = await api("/api/teams");
   state.teams = tRes.teams || [];
 
@@ -197,6 +207,12 @@ async function refreshAllViews() {
     await loadStatsOverview();
   } else if (state.activeTab === "showcase") {
     await loadBugShowcase();
+  } else if (state.activeTab === "realism") {
+    await loadStrengthRealism();
+  } else if (state.activeTab === "helper") {
+    await loadManagerHelper();
+  } else if (state.activeTab === "godmode") {
+    await loadGodMode();
   }
 
   if (state.selectedPlayerId) {
@@ -1484,6 +1500,12 @@ function bindEvents() {
         loadStatsOverview();
       } else if (state.activeTab === "showcase" && !state.showcaseData && state.summary?.path) {
         loadBugShowcase();
+      } else if (state.activeTab === "realism" && !state.realismData && state.summary?.path) {
+        loadStrengthRealism();
+      } else if (state.activeTab === "helper" && !state.helperData && state.summary?.path) {
+        loadManagerHelper();
+      } else if (state.activeTab === "godmode" && !state.godModeData && state.summary?.path) {
+        loadGodMode();
       }
     });
   });
@@ -1507,10 +1529,6 @@ function bindEvents() {
     } catch (err) {
       $("uploadSaveInput").click();
     }
-  });
-
-  $("btnUploadSave").addEventListener("click", () => {
-    $("uploadSaveInput").click();
   });
 
   $("uploadSaveInput").addEventListener("change", async (e) => {
@@ -1698,6 +1716,83 @@ function bindEvents() {
   $("scBlowoutFilterMode").addEventListener("change", renderShowcaseBlowoutTable);
   $("scAwardsFilterMode").addEventListener("change", renderShowcaseAwardsTable);
   $("scPolicyFilterMode").addEventListener("change", renderShowcaseTransfers);
+
+  // Strength & Realism Events
+  document.querySelectorAll(".subtab-btn[data-rsubtab]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".subtab-btn[data-rsubtab]").forEach((b) => b.classList.remove("active"));
+      document.querySelectorAll(".rsubtab-panel").forEach((p) => p.classList.remove("active"));
+      btn.classList.add("active");
+      $(`rsubtab-${btn.dataset.rsubtab}`).classList.add("active");
+    });
+  });
+  $("btnRealismRefresh").addEventListener("click", loadStrengthRealism);
+  $("realismFilterYear").addEventListener("change", loadStrengthRealism);
+  $("realismFocusTeam").addEventListener("change", loadStrengthRealism);
+  $("realismFilterQ").addEventListener("input", () => state.realismData && renderRealismTab());
+  $("diffTeamA").addEventListener("change", () => state.realismData && renderRealismDiff(state.realismData));
+  $("diffTeamB").addEventListener("change", () => state.realismData && renderRealismDiff(state.realismData));
+  $("btnDiffSwap").addEventListener("click", () => {
+    const a = $("diffTeamA").value;
+    const b = $("diffTeamB").value;
+    if (!a || !b || b === "__TOP10__") return;
+    $("diffTeamA").value = b;
+    $("diffTeamB").value = a;
+    if (state.realismData) renderRealismDiff(state.realismData);
+  });
+  document.querySelectorAll("th[data-rsort]").forEach((th) => {
+    th.addEventListener("click", () => {
+      const k = th.dataset.rsort;
+      if (state.realismSortKey === k) state.realismSortDir *= -1;
+      else {
+        state.realismSortKey = k;
+        state.realismSortDir = k === "worldRank" || k === "name" ? 1 : -1;
+      }
+      document.querySelectorAll("th[data-rsort]").forEach((x) => x.classList.remove("sort-active"));
+      th.classList.add("sort-active");
+      if (state.realismData) renderRealismDiffTable(state.realismData);
+    });
+  });
+  ["labTeam1", "labTeam2", "labMap", "labFormat"].forEach((id) => {
+    $(id).addEventListener("change", () => state.realismData && renderRealismMatchup(state.realismData));
+  });
+
+  // Manager Helper Events
+  document.querySelectorAll(".subtab-btn[data-hsubtab]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".subtab-btn[data-hsubtab]").forEach((b) => b.classList.remove("active"));
+      document.querySelectorAll(".hsubtab-panel").forEach((p) => p.classList.remove("active"));
+      btn.classList.add("active");
+      $(`hsubtab-${btn.dataset.hsubtab}`).classList.add("active");
+    });
+  });
+  $("btnHelperRefresh").addEventListener("click", loadManagerHelper);
+  $("helperTeamSelect").addEventListener("change", loadManagerHelper);
+  $("finderTargetPlayer").addEventListener("change", loadManagerHelper);
+  $("finderRolePreset").addEventListener("change", loadManagerHelper);
+  $("helperFilterQ").addEventListener("input", () => state.helperData && renderManagerHelperTab());
+  $("finderAvailFilter").addEventListener("change", () => state.helperData && renderHelperFinder(state.helperData));
+  $("marketFilterMode").addEventListener("change", () => state.helperData && renderHelperMarket(state.helperData));
+  $("wonderkidFilterMode").addEventListener("change", () => state.helperData && renderHelperWonderkids(state.helperData));
+
+  // God Mode Events
+  $("btnGodRefresh").addEventListener("click", loadGodMode);
+  const godBindings = [
+    ["btnGodBoostPreview", "boost_floor_parity", true],
+    ["btnGodBoostApply", "boost_floor_parity", false],
+    ["btnGodNerfPreview", "nerf_superteam_keep_stars", true],
+    ["btnGodNerfApply", "nerf_superteam_keep_stars", false],
+    ["btnGodAiPreview", "fix_ai_sabotage", true],
+    ["btnGodAiApply", "fix_ai_sabotage", false],
+    ["btnGodEconPreview", "rebalance_economy", true],
+    ["btnGodEconApply", "rebalance_economy", false],
+    ["btnGodWkPreview", "inject_wonderkids", true],
+    ["btnGodWkApply", "inject_wonderkids", false],
+  ];
+  godBindings.forEach(([btnId, act, isDry]) => {
+    $(btnId).addEventListener("click", () => runGodModeAction(act, isDry));
+  });
+
   $("btnStatsRefresh").addEventListener("click", loadStatsOverview);
   $("statsFilterYear").addEventListener("change", loadStatsOverview);
   $("statsFilterTeam").addEventListener("change", loadStatsOverview);
@@ -2806,6 +2901,7 @@ function renderBugShowcase() {
   renderShowcaseAwardsTable();
   renderShowcaseTransfers();
   renderShowcaseStability();
+  renderShowcaseFindings();
 }
 
 function renderShowcaseBlowouts() {
@@ -2880,18 +2976,6 @@ function renderShowcaseBlowouts() {
         )
         .join("")
     : `<div class="muted">Not enough simulated rounds yet.</div>`;
-
-  // Engine root causes
-  $("scBlowoutCauses").innerHTML = (b.rootCauses || [])
-    .map(
-      (rc) => `
-      <div class="bug-cause-card">
-        <div class="bug-cause-title">${escapeHtml(rc.title)}</div>
-        <div class="bug-cause-sym mono">${escapeHtml(rc.symbol)}</div>
-        <div class="bug-cause-desc">${escapeHtml(rc.summary)}</div>
-      </div>`
-    )
-    .join("");
 
   renderShowcaseBlowoutTable();
 }
@@ -2989,17 +3073,6 @@ function renderShowcaseTransfers() {
   const t = state.showcaseData?.transfers;
   if (!t) return;
   const q = ($("showcaseFilterQ").value || "").trim().toLowerCase();
-
-  $("scTransferCauses").innerHTML = (t.rootCauses || [])
-    .map(
-      (rc) => `
-      <div class="bug-cause-card">
-        <div class="bug-cause-title">${escapeHtml(rc.title)}</div>
-        <div class="bug-cause-sym mono">${escapeHtml(rc.symbol)}</div>
-        <div class="bug-cause-desc">${escapeHtml(rc.summary)}</div>
-      </div>`
-    )
-    .join("");
 
   const crimes = (t.benchedCrimes || []).filter((c) => {
     if (!q) return true;
@@ -3122,17 +3195,6 @@ function renderShowcaseStability() {
     )
     .join("");
 
-  $("scStabilityCauses").innerHTML = (s.rootCauses || [])
-    .map(
-      (rc) => `
-      <div class="bug-cause-card">
-        <div class="bug-cause-title">${escapeHtml(rc.title)}</div>
-        <div class="bug-cause-sym mono">${escapeHtml(rc.symbol)}</div>
-        <div class="bug-cause-desc">${escapeHtml(rc.summary)}</div>
-      </div>`
-    )
-    .join("");
-
   $("scStintsNote").textContent = `${s.sub6MonthsCount || 0} of ${s.completedStintsCount || 0} ended/benched post-transfer stints lasted under 6.0 months (CS2 pro tier low end: ${s.proFullRange}).`;
   const stintRows = (s.stints || []).filter((r) => {
     if (!q) return true;
@@ -3177,6 +3239,48 @@ function renderShowcaseStability() {
     : `<tr><td colspan="5" class="muted" style="text-align:center;padding:18px;">No high-churn teams matching filter.</td></tr>`;
 }
 
+function renderShowcaseFindings() {
+  const sections = state.showcaseData?.findings || [];
+  const q = ($("showcaseFilterQ").value || "").trim().toLowerCase();
+  let totalShown = 0;
+
+  const html = sections
+    .map((sec) => {
+      const items = (sec.items || []).filter(
+        (it) => !q || `${sec.category} ${it.title} ${it.symbol} ${it.rootCause} ${it.devFix} ${it.liveImpact}`.toLowerCase().includes(q)
+      );
+      if (!items.length) return "";
+      totalShown += items.length;
+      const cardsHtml = items
+        .map((it) => {
+          const sevCls = it.severity === "critical" ? "bad" : it.severity === "high" ? "warn" : it.severity === "warn" ? "info" : "ok";
+          const sevLbl = String(it.severity || "info").toUpperCase();
+          return `<div class="bug-cause-card ${sevCls}">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;">
+              <div class="bug-cause-title">${escapeHtml(it.title)}</div>
+              <span class="tag-pill ${it.severity === "critical" ? "err" : it.severity === "high" ? "warn" : "info"}">${sevLbl}</span>
+            </div>
+            <div class="bug-cause-sym mono">${escapeHtml(it.symbol)}</div>
+            <div style="font-size:11.5px;color:#cbd5e1;margin-bottom:5px;"><strong>Save Impact:</strong> ${escapeHtml(it.liveImpact)}</div>
+            <div class="bug-cause-desc"><strong>Root Cause:</strong> ${escapeHtml(it.rootCause)}</div>
+            <div class="bug-cause-desc" style="margin-top:5px;"><strong>Suggested Fix:</strong> ${escapeHtml(it.devFix)}</div>
+          </div>`;
+        })
+        .join("");
+      return `<div class="subcard" style="margin-top:10px;">
+        <div class="subcard-title" style="display:flex;justify-content:space-between;align-items:center;">
+          <span>${escapeHtml(sec.category)}</span>
+          <span class="tag-pill info">${escapeHtml(sec.tag)}</span>
+        </div>
+        <div class="bug-cause-grid">${cardsHtml}</div>
+      </div>`;
+    })
+    .join("");
+
+  $("scFindingsCount").textContent = `${totalShown} findings`;
+  $("scFindingsContainer").innerHTML = html || '<div class="muted">No documented findings match your filter.</div>';
+}
+
 async function copyShowcaseMarkdown() {
   const d = state.showcaseData;
   if (!d) return toast("Run Re-Scan Save first.", "err");
@@ -3214,6 +3318,14 @@ async function copyShowcaseMarkdown() {
     ...(s.stints || []).slice(0, 8).map(
       (r) => `- \`${r.playerName}\` -> **${r.teamName}** ($${r.fee.toLocaleString()}): **${r.activeDays}d (${r.activeMonths}m)**, ${r.matchesPlayed} matches — ${r.outcome}`
     ),
+    ``,
+    `## 5. Documented Engine Root Causes & Findings`,
+    ...(d.findings || []).flatMap((sec) => [
+      `### ${sec.category}`,
+      ...(sec.items || []).map(
+        (it) => `- **${it.title}** [\`${it.symbol}\`]: ${it.rootCause} *(Impact: ${it.liveImpact})*`
+      ),
+    ]),
   ];
   const md = lines.join("\n");
   try {
@@ -3232,6 +3344,971 @@ async function copyShowcaseMarkdown() {
     toast("Copied Markdown Bug Showcase report to clipboard!", "ok");
   } catch {
     toast("Clipboard copy unavailable in this browser.", "err");
+  }
+}
+
+// ==================== STRENGTH & REALISM ====================
+const _fmtUsd = (n) => "$" + Math.round(Number(n || 0)).toLocaleString("en-US");
+
+function _realismFindTeam(d, tid) {
+  return (d.teamStrengths || []).find((t) => String(t.teamId) === String(tid)) || null;
+}
+
+function _realismBuildTop10AvgTeam(d, excludeId) {
+  const pool = (d.teamStrengths || []).filter(
+    (t) => t.worldRank && t.worldRank <= 10 && String(t.teamId) !== String(excludeId)
+  );
+  const rows = pool.length ? pool : (d.teamStrengths || []).slice(0, 10);
+  if (!rows.length) return null;
+  const avg = (k) => rows.reduce((s, r) => s + Number(r[k] || 0), 0) / rows.length;
+  return {
+    teamId: "__TOP10__",
+    name: `Top-10 Rival Field (${rows.length})`,
+    worldRank: 5,
+    avgSkill: Number(avg("avgSkill").toFixed(2)),
+    mechanicsAvg: Number(avg("mechanicsAvg").toFixed(2)),
+    mentalAvg: Number(avg("mentalAvg").toFixed(2)),
+    weaponsAvg: Number(avg("weaponsAvg").toFixed(2)),
+    bestStarSkill: Number(avg("bestStarSkill").toFixed(2)),
+    weakestLinkSkill: Number(avg("weakestLinkSkill").toFixed(2)),
+    bestAwp: Number(avg("bestAwp").toFixed(2)),
+    bestIgl: Number(avg("bestIgl").toFixed(2)),
+    staffAvgSkill: Number(avg("staffAvgSkill").toFixed(2)),
+    cohesionAvg: Number(avg("cohesionAvg").toFixed(1)),
+    mapReadinessAvg: Number(avg("mapReadinessAvg").toFixed(1)),
+    facilityScore: Number(avg("facilityScore").toFixed(1)),
+    annualWages: Math.round(avg("annualWages")),
+    winPct: Number(avg("winPct").toFixed(1)),
+    trophiesCount: Number(avg("trophiesCount").toFixed(1)),
+    starters: [],
+    isVirtualField: true,
+  };
+}
+
+async function loadStrengthRealism() {
+  if (!state.summary?.path) return;
+  const yr = $("realismFilterYear").value;
+  const focus = $("realismFocusTeam").value;
+  const qs = new URLSearchParams();
+  if (yr) qs.set("year", yr);
+  if (focus) qs.set("focus_team_id", focus);
+  try {
+    const d = await api(`/api/strength-realism?${qs.toString()}`);
+    state.realismData = d;
+    if (!d.loaded) return;
+
+    populateSelect(
+      $("realismFilterYear"),
+      (d.years || []).map((y) => [y, `Season ${y}`]),
+      d.year
+    );
+
+    const teams = d.teamStrengths || [];
+    const teamOpts = teams.map((t) => [
+      t.teamId,
+      `${t.worldRank ? `#${t.worldRank} ` : ""}${t.name}${t.isUserTeam ? " (YOU)" : ""} — ${t.avgSkill} avg`,
+    ]);
+    const focusId = d.trophyRealism?.focusTeamId ?? teams[0]?.teamId ?? "";
+    populateSelect($("realismFocusTeam"), teamOpts, focusId);
+
+    const curA = $("diffTeamA").value || focusId;
+    const defaultB = teams.find((t) => String(t.teamId) !== String(curA))?.teamId || "__TOP10__";
+    const curB = $("diffTeamB").value || defaultB;
+    populateSelect($("diffTeamA"), teamOpts, curA);
+    populateSelect(
+      $("diffTeamB"),
+      [["__TOP10__", "Top-10 Rival Field (Average)"], ...teamOpts],
+      curB
+    );
+
+    const lab1 = $("labTeam1").value || curA;
+    const lab2 = $("labTeam2").value || (teams.find((t) => String(t.teamId) !== String(lab1))?.teamId ?? lab1);
+    populateSelect($("labTeam1"), teamOpts, lab1);
+    populateSelect($("labTeam2"), teamOpts, lab2);
+    const mapsMeta = d.mapsMeta || [];
+    const curMap = $("labMap").value || mapsMeta[0]?.mapId || "";
+    populateSelect($("labMap"), mapsMeta.map((m) => [m.mapId, m.name]), curMap);
+
+    renderRealismTab();
+  } catch (err) {
+    toast(`Strength & Realism load failed: ${err.message}`, "err");
+  }
+}
+
+function renderRealismTab() {
+  const d = state.realismData;
+  if (!d || !d.loaded) return;
+  renderRealismKpis(d);
+  renderRealismDiff(d);
+  renderRealismDiffTable(d);
+  renderRealismTrophies(d);
+  renderRealismMatchup(d);
+  renderRealismRegression(d);
+  renderRealismParity(d);
+}
+
+function renderRealismKpis(d) {
+  const tr = d.trophyRealism || {};
+  const edge = Number(tr.skillEdgeVsTop10 || 0);
+  const def = Number(tr.oddsDefiancePp || 0);
+  const kpis = [
+    { label: `${tr.focusTeamName || "Focus"} Avg Skill`, val: tr.avgSkill ?? "-", sub: `${edge >= 0 ? "+" : ""}${edge} vs Top-10 (${tr.rivalTop10AvgSkill ?? "-"})` },
+    { label: `${d.year} Trophies Won`, val: tr.trophiesWon ?? 0, sub: `${tr.tier1TrophiesWon ?? 0}/${tr.totalTier1Completed ?? 0} Tier-1 (${tr.trophySharePct ?? 0}% share)` },
+    { label: "Match Record", val: `${tr.wins ?? 0}W - ${tr.losses ?? 0}L`, sub: `${tr.winPct ?? 0}% win rate • Streak ${tr.maxWinStreak ?? 0}` },
+    { label: "Odds Defiance", val: `${def >= 0 ? "+" : ""}${def} pp`, sub: `Expected ${tr.avgPreMatchOdds ?? 0}% pre-match` },
+    { label: "#1 World Skill Bar", val: d.rank1Skill ?? "-", sub: `Top-10 Avg: ${d.top10AvgSkill ?? "-"}` },
+  ];
+  $("realismKpiGrid").innerHTML = kpis
+    .map(
+      (k) => `<div class="kpi-card">
+        <div class="kpi-label">${escapeHtml(k.label)}</div>
+        <div class="kpi-val">${escapeHtml(k.val)}</div>
+        <div class="kpi-sub">${escapeHtml(k.sub)}</div>
+      </div>`
+    )
+    .join("");
+}
+
+function renderRealismDiff(d) {
+  const tA = _realismFindTeam(d, $("diffTeamA").value);
+  const bVal = $("diffTeamB").value;
+  const tB = bVal === "__TOP10__" ? _realismBuildTop10AvgTeam(d, tA?.teamId) : _realismFindTeam(d, bVal);
+  if (!tA || !tB) {
+    $("diffH2HSummary").innerHTML = "Select two teams to compare.";
+    $("diffH2HBars").innerHTML = "";
+    $("diffH2HRosters").innerHTML = "";
+    return;
+  }
+
+  const skillDiff = Number((tA.avgSkill - tB.avgSkill).toFixed(2));
+  const floorDiff = Number((tA.weakestLinkSkill - tB.weakestLinkSkill).toFixed(2));
+  const pA = Math.pow(Math.max(1, tA.avgSkill), 2.8);
+  const pB = Math.pow(Math.max(1, tB.avgSkill), 2.8);
+  const mapOddsA = Number(((pA / (pA + pB)) * 100).toFixed(1));
+  const cls = Math.abs(skillDiff) >= 1.2 ? "bad" : Math.abs(skillDiff) >= 0.45 ? "warn" : "ok";
+
+  $("diffH2HSummary").className = `verdict-banner ${cls}`;
+  $("diffH2HSummary").innerHTML = `<div class="verdict-headline">${escapeHtml(tA.name)} (${tA.avgSkill}) vs ${escapeHtml(tB.name)} (${tB.avgSkill})</div>
+    <div>Skill edge: <strong class="${skillDiff >= 0 ? "stat-good" : "stat-bad"}">${skillDiff >= 0 ? "+" : ""}${skillDiff}</strong> per skill avg &bull; Weakest-link floor diff: <strong>${floorDiff >= 0 ? "+" : ""}${floorDiff}</strong> &bull; Neutral-map engine odds (<code>skill^2.8</code>): <strong>${mapOddsA}%</strong> vs <strong>${(100 - mapOddsA).toFixed(1)}%</strong>.</div>`;
+
+  const metrics = [
+    { label: "Active Avg Skill (1-20)", a: tA.avgSkill, b: tB.avgSkill, max: 20 },
+    { label: "Star Peak (Best Starter)", a: tA.bestStarSkill, b: tB.bestStarSkill, max: 20 },
+    { label: "Weakest-Link Floor", a: tA.weakestLinkSkill, b: tB.weakestLinkSkill, max: 20 },
+    { label: "Mechanics Avg (6)", a: tA.mechanicsAvg, b: tB.mechanicsAvg, max: 20 },
+    { label: "Mental Avg (4)", a: tA.mentalAvg, b: tB.mentalAvg, max: 20 },
+    { label: "Weapons Avg (5)", a: tA.weaponsAvg, b: tB.weaponsAvg, max: 20 },
+    { label: "Best AWPer Score", a: tA.bestAwp, b: tB.bestAwp, max: 20 },
+    { label: "Best IGL Score", a: tA.bestIgl, b: tB.bestIgl, max: 20 },
+    { label: "Coaching Staff Avg", a: tA.staffAvgSkill, b: tB.staffAvgSkill, max: 20 },
+    { label: "Cohesion / Chemistry %", a: tA.cohesionAvg, b: tB.cohesionAvg, max: 100 },
+    { label: "Map Pool Comfort Avg", a: tA.mapReadinessAvg, b: tB.mapReadinessAvg, max: 100 },
+    { label: "Facility Grade Score", a: tA.facilityScore, b: tB.facilityScore, max: 100 },
+  ];
+
+  $("diffH2HBars").innerHTML = `<div class="h2h-list">${metrics
+    .map((m) => {
+      const aPct = Math.min(100, Math.max(2, (Number(m.a || 0) / m.max) * 100)).toFixed(1);
+      const bPct = Math.min(100, Math.max(2, (Number(m.b || 0) / m.max) * 100)).toFixed(1);
+      const dVal = Number((Number(m.a || 0) - Number(m.b || 0)).toFixed(2));
+      const dTag = dVal > 0 ? `+${dVal}` : `${dVal}`;
+      return `<div class="h2h-row">
+        <div class="h2h-head">
+          <span class="h2h-val-a" style="color:${dVal >= 0 ? "#7dd3fc" : "var(--text-muted)"};">${m.a}</span>
+          <span class="h2h-label">${escapeHtml(m.label)} (${dTag})</span>
+          <span class="h2h-val-b" style="color:${dVal <= 0 ? "#fbbf24" : "var(--text-muted)"};">${m.b}</span>
+        </div>
+        <div class="h2h-track">
+          <div class="h2h-half left"><div class="h2h-fill-a" style="width:${aPct}%"></div></div>
+          <div class="h2h-half right"><div class="h2h-fill-b" style="width:${bPct}%"></div></div>
+        </div>
+      </div>`;
+    })
+    .join("")}</div>`;
+
+  const renderRosterCard = (team, accent) => {
+    if (team.isVirtualField) {
+      return `<div class="roster-vs-card">
+        <div class="roster-vs-title"><span style="color:${accent};">${escapeHtml(team.name)}</span><span>${team.avgSkill} avg</span></div>
+        <div class="muted" style="font-size:12px;">Aggregate benchmark across Top-10 rivals.<br>Avg Win%: ${team.winPct}% &bull; Avg Titles: ${team.trophiesCount}<br>Avg Wages: ${_fmtUsd(team.annualWages)}/yr</div>
+      </div>`;
+    }
+    const items = (team.starters || [])
+      .map(
+        (p) => `<div class="roster-vs-item">
+          <a href="#" class="link-btn ps-open" data-pid="${p.playerId}">${escapeHtml(p.name)} <span class="muted">(${p.age}y)</span></a>
+          <span><strong>${p.avgSkill}</strong> <span class="muted">(${p.yearRating > 0 ? p.yearRating.toFixed(2) : "-"})</span></span>
+        </div>`
+      )
+      .join("");
+    return `<div class="roster-vs-card">
+      <div class="roster-vs-title"><span style="color:${accent};">${escapeHtml(team.name)}</span><span>${team.avgSkill} avg &bull; ${_fmtUsd(team.annualWages)}</span></div>
+      ${items || '<div class="muted">No active starters</div>'}
+    </div>`;
+  };
+
+  $("diffH2HRosters").innerHTML = `<div class="roster-vs-grid">${renderRosterCard(tA, "#38bdf8")}${renderRosterCard(tB, "#fbbf24")}</div>`;
+  $("diffH2HRosters").querySelectorAll(".ps-open").forEach((el) => {
+    el.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      openPlayerStatsModal(Number(el.dataset.pid));
+    });
+  });
+}
+
+function renderRealismDiffTable(d) {
+  const q = ($("realismFilterQ").value || "").trim().toLowerCase();
+  const rows = (d.teamStrengths || []).filter((r) => {
+    if (!q) return true;
+    const starterMatch = (r.starters || []).some((p) => p.name.toLowerCase().includes(q));
+    return r.name.toLowerCase().includes(q) || (r.nationName || "").toLowerCase().includes(q) || starterMatch;
+  });
+
+  const k = state.realismSortKey;
+  const dir = state.realismSortDir;
+  rows.sort((a, b) => {
+    if (k === "name") return String(a.name).localeCompare(String(b.name)) * dir;
+    const va = a[k] ?? (dir > 0 ? 999999 : -999999);
+    const vb = b[k] ?? (dir > 0 ? 999999 : -999999);
+    if (va === vb) return (a.worldRank || 9999) - (b.worldRank || 9999);
+    return (va < vb ? -1 : 1) * dir;
+  });
+
+  $("diffTableCount").textContent = `${rows.length} teams`;
+  $("diffTableBody").innerHTML = rows
+    .map((r) => {
+      const gapCls = r.gapVsRank1 >= 0 ? "stat-good" : r.gapVsRank1 <= -1.2 ? "stat-bad" : "";
+      const benchNote = r.benchWasteGap > 0 ? ` <span class="tag-pill warn" title="Best benched ${r.bestBenchedName} (${r.bestBenchedSkill}) exceeds weakest starter by +${r.benchWasteGap}">Bench +${r.benchWasteGap}</span>` : "";
+      return `<tr>
+        <td>${r.worldRank ? `#${r.worldRank}` : "-"}</td>
+        <td><a href="#" class="link-btn ts-open" data-tid="${r.teamId}">${escapeHtml(r.name)}</a>${r.isUserTeam ? ' <span class="tag-pill info">YOU</span>' : ""}${benchNote}</td>
+        <td><strong>${r.avgSkill}</strong> <span class="muted">(${Math.round(r.practicalSkillTotal)})</span></td>
+        <td class="${gapCls}">${r.gapVsRank1 >= 0 ? "+" : ""}${r.gapVsRank1}</td>
+        <td>${r.bestStarSkill} / <span class="muted">${r.weakestLinkSkill}</span></td>
+        <td class="muted">${r.mechanicsAvg} / ${r.mentalAvg} / ${r.weaponsAvg}</td>
+        <td>${r.staffAvgSkill}</td>
+        <td>${r.cohesionAvg}%</td>
+        <td>${r.mapReadinessAvg}</td>
+        <td>${r.gameOddsVsRank1}%</td>
+        <td>${r.winPct}% <span class="muted">(${r.wins}-${r.losses})</span></td>
+        <td><strong>${r.trophiesCount}</strong></td>
+        <td><button class="btn btn-sm r-compare-btn" data-tid="${r.teamId}">Compare</button></td>
+      </tr>`;
+    })
+    .join("");
+
+  $("diffTableBody").querySelectorAll(".ts-open").forEach((el) => {
+    el.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      openTeamStatsModal(Number(el.dataset.tid));
+    });
+  });
+  $("diffTableBody").querySelectorAll(".r-compare-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      $("diffTeamB").value = btn.dataset.tid;
+      renderRealismDiff(d);
+      $("diffH2HSummary").scrollIntoView({ behavior: "smooth", block: "nearest" });
+    });
+  });
+}
+
+function renderRealismTrophies(d) {
+  const tr = d.trophyRealism || {};
+  const pillCls = tr.verdictLevel === "bad" ? "pill err" : tr.verdictLevel === "warn" ? "pill warn" : "pill ok";
+  $("realismVerdictTitle").textContent = `${tr.focusTeamName || "Team"} — ${d.year} Trophy & Dominance Realism Audit`;
+  $("realismVerdictPill").className = pillCls;
+  $("realismVerdictPill").textContent = tr.verdict || "N/A";
+
+  const pb = tr.proBenchmarks || {};
+  $("realismVerdictBanner").className = `verdict-banner ${tr.verdictLevel || "ok"}`;
+  $("realismVerdictBanner").innerHTML = `<div class="verdict-headline">${escapeHtml(tr.focusTeamName)} won ${tr.trophiesWon} titles (${tr.tier1TrophiesWon}/${tr.totalTier1Completed} Tier-1 = ${tr.trophySharePct}% share) at ${tr.winPct}% match win rate</div>
+    <div><strong>Real CS2 Pro Peak (${escapeHtml(pb.proBestExamples)}):</strong> ${escapeHtml(pb.proPeakTitlesYr)}/yr &bull; ${escapeHtml(pb.proPeakMatchWinPct)} match win% &bull; ${escapeHtml(pb.proPeakSweepShare)} big-event share. <strong>Save Reality:</strong> +${tr.skillEdgeVsTop10} avg skill edge produced <strong>${tr.wins}W-${tr.losses}L</strong> (max streak ${tr.maxWinStreak}) even though pre-match game odds averaged only <strong>${tr.avgPreMatchOdds}%</strong>.</div>`;
+
+  $("realismReasonsGrid").innerHTML = (tr.factors || [])
+    .map(
+      (f) => `<div class="bug-cause-card">
+        <div class="bug-cause-title">${escapeHtml(f.title)}</div>
+        <div class="bug-cause-desc">${escapeHtml(f.summary)}</div>
+      </div>`
+    )
+    .join("");
+
+  $("realismCalBars").innerHTML = (d.oddsCalibration || [])
+    .map((c) => {
+      const diffCls = c.diffPp >= 10 ? "stat-good" : c.diffPp <= -5 ? "stat-bad" : "";
+      return `<div class="cal-row">
+        <div><strong>${escapeHtml(c.bucket)}</strong><div class="muted" style="font-size:10px;">${c.matches}m</div></div>
+        <div class="cal-bar-wrap" title="Bar = Actual ${c.actualPct}%, Gold line = Pre-Match ${c.expectedPct}%">
+          <div class="cal-bar-actual" style="width:${c.actualPct}%"></div>
+          <div class="cal-marker-exp" style="left:${c.expectedPct}%"></div>
+        </div>
+        <div style="text-align:right;">Actual <strong>${c.actualPct}%</strong> <span class="${diffCls}">(${c.diffPp >= 0 ? "+" : ""}${c.diffPp}pp)</span></div>
+      </div>`;
+    })
+    .join("");
+
+  $("realismFormatBody").innerHTML = (d.formatCalibration || [])
+    .map(
+      (f) => `<tr>
+        <td><strong>${escapeHtml(f.format)}</strong></td>
+        <td>${f.matches}</td>
+        <td>${f.expectedPct}%</td>
+        <td><strong>${f.actualPct}%</strong></td>
+        <td class="${f.diffPp >= 5 ? "stat-good" : ""}">${f.diffPp >= 0 ? "+" : ""}${f.diffPp} pp</td>
+      </tr>`
+    )
+    .join("");
+
+  const league = tr.leagueTrophyTable || [];
+  $("realismChampCount").textContent = `${league.length} contenders`;
+  $("realismLeagueBody").innerHTML = league
+    .map(
+      (r) => `<tr>
+        <td><a href="#" class="link-btn ts-open" data-tid="${r.teamId}">${escapeHtml(r.name)}</a></td>
+        <td>${r.worldRank ? `#${r.worldRank}` : "-"}</td>
+        <td>${r.avgSkill}</td>
+        <td><strong>${r.trophiesCount}</strong></td>
+        <td>${r.tier1TrophiesCount} <span class="muted">(${r.trophySharePct}%)</span></td>
+        <td>${r.winPct}% <span class="muted">(streak ${r.maxWinStreak})</span></td>
+      </tr>`
+    )
+    .join("");
+
+  const focusObj = _realismFindTeam(d, tr.focusTeamId);
+  const haul = focusObj?.trophies || [];
+  $("realismHaulTitle").textContent = `${focusObj?.name || "Focus Team"}'s ${d.year} Trophy Haul & Winning Lineups`;
+  $("realismHaulCount").textContent = `${haul.length} trophies`;
+  $("realismHaulBody").innerHTML = haul.length
+    ? haul
+        .map(
+          (h) => `<tr>
+            <td>${escapeHtml(h.seasonPart)}</td>
+            <td><strong>${escapeHtml(h.tournamentName)}</strong></td>
+            <td>${h.reputation}</td>
+            <td>${h.isTier1 ? '<span class="tag-pill info">Tier 1</span>' : '<span class="tag-pill">Minor/Tier 2</span>'}</td>
+            <td>${escapeHtml((h.winningRoster || []).join(", ") || "-")}</td>
+          </tr>`
+        )
+        .join("")
+    : '<tr><td colspan="5" class="muted">No trophies recorded in this season year.</td></tr>';
+
+  $("realismLeagueBody").querySelectorAll(".ts-open").forEach((el) => {
+    el.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      openTeamStatsModal(Number(el.dataset.tid));
+    });
+  });
+}
+
+function renderRealismMatchup(d) {
+  const t1 = _realismFindTeam(d, $("labTeam1").value);
+  const t2 = _realismFindTeam(d, $("labTeam2").value);
+  const mapId = Number($("labMap").value || 0);
+  const mapName = (d.mapsMeta || []).find((m) => Number(m.mapId) === mapId)?.name || "Selected Map";
+  const fmt = Number($("labFormat").value || 3);
+  if (!t1 || !t2) {
+    $("labResultPanel").innerHTML = '<div class="muted">Select two teams to simulate matchup odds.</div>';
+    return;
+  }
+
+  const c1 = Number(t1.mapComforts?.[String(mapId)] ?? t1.mapReadinessAvg ?? 50);
+  const c2 = Number(t2.mapComforts?.[String(mapId)] ?? t2.mapReadinessAvg ?? 50);
+  const mult = (c) => 1.0 + 0.2 * ((c - 50.0) / 50.0);
+  const pwr1 = Math.pow(Math.max(1, t1.avgSkill), 2.8) * mult(c1);
+  const pwr2 = Math.pow(Math.max(1, t2.avgSkill), 2.8) * mult(c2);
+  const mapProb1 = pwr1 / (pwr1 + pwr2);
+  const seriesProb = (p, bo) => {
+    if (bo === 1) return p;
+    if (bo === 3) return p * p * (3 - 2 * p);
+    return p * p * p * (10 - 15 * p + 6 * p * p);
+  };
+  const s1 = seriesProb(mapProb1, fmt);
+
+  const favIs1 = mapProb1 >= 0.5;
+  const favMapPct = Math.max(mapProb1, 1 - mapProb1) * 100;
+  const fmtRow = (d.formatCalibration || []).find((f) => f.format === `BO${fmt}`);
+  const calBucket = (d.oddsCalibration || []).find((b) => {
+    const [lo, hi] = b.bucket.replace("%", "").split("-").map(Number);
+    return favMapPct >= lo && favMapPct <= hi + 0.01;
+  }) || d.oddsCalibration?.[d.oddsCalibration.length - 1];
+
+  const boxHtml = (label, val, sub, cls = "") => `<div class="lab-box">
+    <div class="lab-box-title">${escapeHtml(label)}</div>
+    <div class="lab-odds-big ${cls}">${escapeHtml(val)}</div>
+    <div class="muted" style="font-size:12px;margin-top:4px;">${sub}</div>
+  </div>`;
+
+  $("labResultPanel").innerHTML = `<div class="lab-grid">
+    ${boxHtml(`Single Map Odds (${mapName})`, `${(mapProb1 * 100).toFixed(1)}% vs ${((1 - mapProb1) * 100).toFixed(1)}%`, `${escapeHtml(t1.name)} comfort ${c1} (&times;${mult(c1).toFixed(2)}) vs ${escapeHtml(t2.name)} comfort ${c2} (&times;${mult(c2).toFixed(2)})`, favIs1 ? "stat-good" : "")}
+    ${boxHtml(`BO${fmt} IID Series Odds`, `${(s1 * 100).toFixed(1)}% vs ${((1 - s1) * 100).toFixed(1)}%`, `Compounded from single-map ${mapName} probability`, s1 >= 0.65 ? "stat-good" : "")}
+    ${boxHtml(`Save Empirical ${calBucket ? calBucket.bucket : ""} Bucket`, calBucket ? `${calBucket.actualPct}%` : "-", `${escapeHtml(favIs1 ? t1.name : t2.name)} favorite tier across ${calBucket?.matches ?? 0} save matches (BO${fmt} avg ${fmtRow?.actualPct ?? "-"}%)`, "stat-good")}
+    ${boxHtml("Roster Edge Breakdown", `${(t1.avgSkill - t2.avgSkill) >= 0 ? "+" : ""}${(t1.avgSkill - t2.avgSkill).toFixed(2)} avg`, `Floor: ${t1.weakestLinkSkill} vs ${t2.weakestLinkSkill} &bull; Coh: ${t1.cohesionAvg}% vs ${t2.cohesionAvg}%`)}
+  </div>`;
+}
+
+function _renderSignedCorrBars(rows, titleSuffix = "") {
+  if (!rows || !rows.length) return '<div class="muted">Not enough sample data yet.</div>';
+  return rows
+    .map((c) => {
+      const r = Number(c.r || 0);
+      const w = Math.min(100, Math.round(Math.abs(r) * 100));
+      const cls = r >= 0 ? "corr-fill-pos" : "corr-fill-neg";
+      const valCls = r >= 0.35 ? "stat-good" : r <= -0.35 ? "stat-bad" : "";
+      return `<div class="corr-row">
+        <div><strong>${escapeHtml(c.label)}</strong>${c.group ? ` <span class="muted" style="font-size:10px;">${escapeHtml(c.group)}</span>` : ""}</div>
+        <div class="corr-track"><div class="${cls}" style="width:${w}%"></div></div>
+        <div class="${valCls}" style="text-align:right;font-variant-numeric:tabular-nums;">${r >= 0 ? "+" : ""}${r.toFixed(2)}${titleSuffix}</div>
+      </div>`;
+    })
+    .join("");
+}
+
+function renderRealismRegression(d) {
+  const reg = d.regression || {};
+  const ols = reg.olsModel || {};
+  $("regSamplePill").textContent = `${reg.sampleSize || 0} players`;
+  $("regOlsSubtitle").textContent = `OLS fit: Expected Rating = ${ols.slope ?? 0} * AvgSkill + ${ols.intercept ?? 0} (R² = ${ols.r2 ?? 0})`;
+  $("regSkillBars").innerHTML = _renderSignedCorrBars(reg.skillCorrelations || []);
+
+  const curve = reg.ageCurve || [];
+  $("regAgeCurveBody").innerHTML = curve.length
+    ? curve
+        .map(
+          (a) => `<tr>
+            <td><strong>${escapeHtml(a.bracket)}</strong></td>
+            <td>${a.count}</td>
+            <td>${a.avgSkill}</td>
+            <td>${a.avgPot}</td>
+            <td class="${a.headroom >= 1.5 ? "stat-good" : ""}">+${a.headroom}</td>
+            <td><strong>${a.avgRating > 0 ? a.avgRating.toFixed(3) : "-"}</strong></td>
+          </tr>`
+        )
+        .join("")
+    : '<tr><td colspan="6" class="muted">No age curve data.</td></tr>';
+
+  const q = ($("realismFilterQ").value || "").trim().toLowerCase();
+  const renderResidTable = (bodyId, list, isPos) => {
+    const filtered = (list || []).filter((r) => !q || r.name.toLowerCase().includes(q) || r.teamName.toLowerCase().includes(q));
+    $(bodyId).innerHTML = filtered.length
+      ? filtered
+          .map(
+            (r) => `<tr>
+              <td><a href="#" class="link-btn ps-open" data-pid="${r.playerId}">${escapeHtml(r.name)}</a> <span class="muted">(${r.age}y)</span></td>
+              <td><a href="#" class="link-btn ts-open" data-tid="${r.teamId}">${escapeHtml(r.teamName)}</a></td>
+              <td>${r.avgSkill}</td>
+              <td class="muted">${r.expectedRating.toFixed(2)}</td>
+              <td><strong>${r.actualRating.toFixed(2)}</strong></td>
+              <td class="${isPos ? "stat-good" : "stat-bad"}">${r.residual >= 0 ? "+" : ""}${r.residual.toFixed(3)}</td>
+            </tr>`
+          )
+          .join("")
+      : '<tr><td colspan="6" class="muted">No matching players.</td></tr>';
+    _bindStatsModalLinks($(bodyId));
+  };
+  renderResidTable("regOverBody", reg.overperformers, true);
+  renderResidTable("regUnderBody", reg.underperformers, false);
+}
+
+function renderRealismParity(d) {
+  const par = d.parity || {};
+  const dist = par.distributions || {};
+  const fmtVal = (k, v) => (k === "teamWages" || k === "teamBalance" ? _fmtUsd(v) : Number(v || 0).toFixed(2));
+  const cards = [
+    ["teamSkill", "Team Avg Skill (1-20)"],
+    ["playerSkill", "All Players Avg Skill (1-20)"],
+    ["teamWages", "Team Annual Payroll"],
+    ["teamBalance", "Team Cash Reserves"],
+  ];
+  $("parityDistGrid").innerHTML = cards
+    .map(([key, title]) => {
+      const m = dist[key] || {};
+      return `<div class="lab-box">
+        <div class="lab-box-title">${escapeHtml(title)}</div>
+        <div class="lab-odds-big">${(m.gini ?? 0).toFixed(3)} <span class="muted" style="font-size:12px;font-weight:500;">Gini</span></div>
+        <div class="muted" style="font-size:12px;margin-top:6px;">
+          P10: ${fmtVal(key, m.p10)} &bull; Med: <strong>${fmtVal(key, m.p50)}</strong> &bull; P90: ${fmtVal(key, m.p90)}<br>
+          Min: ${fmtVal(key, m.min)} &bull; Max: ${fmtVal(key, m.max)} (${m.count || 0} samples)
+        </div>
+      </div>`;
+    })
+    .join("");
+
+  $("parityTeamSample").textContent = `${par.teamSampleSize || 0} teams`;
+  $("parityTeamCorrBars").innerHTML = _renderSignedCorrBars(par.teamFactorCorrelations || []);
+
+  const nations = par.nationMeta || [];
+  $("parityNationBody").innerHTML = nations.length
+    ? nations
+        .map(
+          (n) => `<tr>
+            <td><strong>${escapeHtml(n.nationName)}</strong></td>
+            <td>${n.playerCount}</td>
+            <td class="${n.elite16Plus >= 5 ? "stat-good" : ""}">${n.elite16Plus}</td>
+            <td>${n.avgSkill}</td>
+            <td>${n.avgPot}</td>
+            <td>${n.avgRating > 0 ? n.avgRating.toFixed(3) : "-"}</td>
+          </tr>`
+        )
+        .join("")
+    : '<tr><td colspan="6" class="muted">No nation aggregates.</td></tr>';
+}
+
+function _bindStatsModalLinks(container) {
+  if (!container) return;
+  container.querySelectorAll(".ps-open").forEach((el) => {
+    el.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      openPlayerStatsModal(Number(el.dataset.pid));
+    });
+  });
+  container.querySelectorAll(".ts-open").forEach((el) => {
+    el.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      const tid = Number(el.dataset.tid);
+      if (tid > 0) openTeamStatsModal(tid);
+    });
+  });
+}
+
+// ==================== MANAGER HELPER LAB ====================
+async function loadManagerHelper() {
+  if (!state.summary?.path) return;
+  const tid = $("helperTeamSelect").value;
+  const targetPid = $("finderTargetPlayer").value;
+  const preset = $("finderRolePreset").value || "match";
+  const qs = new URLSearchParams();
+  if (tid) qs.set("team_id", tid);
+  if (targetPid) qs.set("target_player_id", targetPid);
+  qs.set("role_preset", preset);
+  try {
+    const d = await api(`/api/manager-helper?${qs.toString()}`);
+    state.helperData = d;
+    if (!d.loaded) return;
+
+    const teams = d.teams || [];
+    const selTid = d.rosterOptimizer?.teamId ?? teams[0]?.teamId ?? "";
+    populateSelect(
+      $("helperTeamSelect"),
+      teams.map((t) => [t.teamId, `${t.worldRank ? `#${t.worldRank} ` : ""}${t.name}${t.isUserTeam ? " (YOU)" : ""} — ${t.avgSkill}`]),
+      selTid
+    );
+
+    const starters = d.rosterOptimizer?.starters || [];
+    const curTarget = $("finderTargetPlayer").value;
+    const keepTarget = starters.some((s) => String(s.playerId) === String(curTarget));
+    const refPid = d.replacementFinder?.reference?.playerId || starters[starters.length - 1]?.playerId || "";
+    populateSelect(
+      $("finderTargetPlayer"),
+      starters.map((s) => [s.playerId, `${s.name} (${s.bestRole}, ${s.avgSkill} avg)`]),
+      keepTarget ? curTarget : refPid
+    );
+
+    renderManagerHelperTab();
+  } catch (err) {
+    toast(`Manager Helper load failed: ${err.message}`, "err");
+  }
+}
+
+async function prepTransferFromHelper(pid, destTid) {
+  document.querySelector('.tab-btn[data-tab="transfers"]')?.click();
+  $("txPlayerSearch").value = String(pid);
+  renderTxPlayerOptions();
+  if ($("txPlayerSelect").querySelector(`option[value="${pid}"]`)) {
+    $("txPlayerSelect").value = String(pid);
+    await onTxPlayerChange();
+  }
+  if (destTid > 0) {
+    $("txTeamSearch").value = "";
+    renderTxTeamOptions();
+    if ($("txTargetTeam").querySelector(`option[value="${destTid}"]`)) {
+      $("txTargetTeam").value = String(destTid);
+      await loadTargetRosterPreview();
+    }
+  }
+  toast(`Loaded player #${pid} in Transfers tab`, "info");
+}
+
+function _bindHelperActionButtons(container, managingTid) {
+  _bindStatsModalLinks(container);
+  container.querySelectorAll(".btn-prep-tx").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      prepTransferFromHelper(Number(btn.dataset.pid), managingTid);
+    });
+  });
+}
+
+function renderManagerHelperTab() {
+  const d = state.helperData;
+  if (!d || !d.loaded) return;
+  renderHelperKpis(d);
+  renderHelperRoster(d);
+  renderHelperFinder(d);
+  renderHelperMarket(d);
+  renderHelperWonderkids(d);
+}
+
+function renderHelperKpis(d) {
+  const ro = d.rosterOptimizer || {};
+  const mr = d.marketRadar || {};
+  const benchGain = ro.benched?.[0]?.upgradeVsWorstStarter || 0;
+  const kpis = [
+    { label: `${ro.name || "Team"} Active Avg`, val: ro.avgSkill ?? "-", sub: `${ro.worldRank ? `World #${ro.worldRank} • ` : ""}${ro.mainLanguageName || ""} • ${ro.hiringBiasLabel || "Open"}` },
+    { label: "Cash / Payroll", val: _fmtUsd(ro.balance), sub: `Annual wages: ${_fmtUsd(ro.annualWages)}` },
+    { label: "Best Bench Delta", val: benchGain > 0 ? `+${benchGain}` : "Optimal", sub: `${ro.benched?.length || 0} benched player(s)` },
+    { label: "Market Bargains / FAs", val: `${(mr.bargains || []).length} / ${(mr.freeAgents || []).length}`, sub: `${(mr.expiring || []).length} expiring <=12m` },
+    { label: "U21 Wonderkids", val: (d.wonderkids || []).length, sub: `Top pot: ${d.wonderkids?.[0]?.avgPot ?? "-"}` },
+  ];
+  $("helperKpiGrid").innerHTML = kpis
+    .map(
+      (k) => `<div class="kpi-card">
+        <div class="kpi-label">${escapeHtml(k.label)}</div>
+        <div class="kpi-val">${escapeHtml(k.val)}</div>
+        <div class="kpi-sub">${escapeHtml(k.sub)}</div>
+      </div>`
+    )
+    .join("");
+}
+
+function renderHelperRoster(d) {
+  const ro = d.rosterOptimizer || {};
+  $("helperOptTitle").textContent = `${ro.name || "Team"} — GM Diagnostics & Lineup Audit`;
+  $("helperPolicyPill").textContent = `Main: ${ro.mainLanguageName || "-"} • ${ro.hiringBiasLabel || "Open"}`;
+  $("helperAlertsList").innerHTML = (ro.alerts || [])
+    .map(
+      (a) => `<div class="bug-cause-card ${escapeHtml(a.severity || "info")}">
+        <div class="bug-cause-title">${escapeHtml(a.title)}</div>
+        <div class="bug-cause-desc">${escapeHtml(a.detail)}</div>
+      </div>`
+    )
+    .join("");
+
+  const q = ($("helperFilterQ").value || "").trim().toLowerCase();
+  const combined = [
+    ...(ro.starters || []).map((r, i) => ({ ...r, _isBench: false, _weakest: i === (ro.starters || []).length - 1 })),
+    ...(ro.benched || []).map((r) => ({ ...r, _isBench: true, _weakest: false })),
+  ].filter((r) => !q || r.name.toLowerCase().includes(q) || r.languages.toLowerCase().includes(q));
+
+  $("helperSquadCount").textContent = `${ro.starters?.length || 0} active / ${ro.benched?.length || 0} bench`;
+  $("helperRosterBody").innerHTML = combined.length
+    ? combined
+        .map((r) => {
+          const badges = [
+            r._isBench ? '<span class="tag-pill warn">Bench</span>' : '<span class="tag-pill ok">Starter</span>',
+            r._weakest ? '<span class="tag-pill info">Floor</span>' : "",
+            r.isCurrentIgl ? '<span class="tag-pill info">IGL</span>' : "",
+            r.isCurrentAwp ? '<span class="tag-pill info">AWP</span>' : "",
+            !r.speaksMainLang ? '<span class="tag-pill err">No Lang</span>' : "",
+            !r.policyOk ? '<span class="tag-pill err">Policy!</span>' : "",
+          ].join("");
+          const btnTxt = r._isBench ? "Promote" : "Find Sub";
+          return `<tr>
+            <td><a href="#" class="link-btn ps-open" data-pid="${r.playerId}">${escapeHtml(r.name)}</a> <span class="muted">(${r.age}y)</span></td>
+            <td>${badges}</td>
+            <td>${escapeHtml(r.bestRole)}</td>
+            <td><strong>${r.avgSkill}</strong> <span class="muted">(${r.avgPot})</span></td>
+            <td class="muted">${r.iglScore} / ${r.awpScore}</td>
+            <td style="font-size:11.5px;">${escapeHtml(r.languages)}</td>
+            <td>${_fmtUsd(r.salaryYear)}</td>
+            <td><button class="btn btn-sm helper-row-act" data-pid="${r.playerId}" data-bench="${r._isBench ? 1 : 0}">${btnTxt}</button></td>
+          </tr>`;
+        })
+        .join("")
+    : '<tr><td colspan="8" class="muted">No matching players.</td></tr>';
+
+  _bindStatsModalLinks($("helperRosterBody"));
+  $("helperRosterBody").querySelectorAll(".helper-row-act").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const pid = Number(btn.dataset.pid);
+      if (btn.dataset.bench === "1") {
+        await api(`/api/player/${pid}/bench`, { method: "POST", body: JSON.stringify({ benched: false, autoTactics: true }) });
+        toast(`Promoted player #${pid} & recalculated tactics`, "ok");
+        await refreshSummaryOnly();
+        await loadManagerHelper();
+      } else {
+        $("finderTargetPlayer").value = String(pid);
+        $("finderRolePreset").value = "match";
+        document.querySelector('.subtab-btn[data-hsubtab="finder"]')?.click();
+        await loadManagerHelper();
+      }
+    });
+  });
+
+  const maps = ro.mapComforts || [];
+  $("helperMapBars").innerHTML = maps.length
+    ? maps
+        .map((m) => {
+          const c = Number(m.comfort || 0);
+          const barCls = c >= 75 ? "corr-fill-pos" : c < 55 ? "corr-fill-neg" : "h2h-fill-b";
+          return `<div class="corr-row">
+            <div><strong>${escapeHtml(m.name)}</strong></div>
+            <div class="corr-track"><div class="${barCls}" style="width:${c}%"></div></div>
+            <div class="${c >= 75 ? "stat-good" : c < 55 ? "stat-bad" : ""}" style="text-align:right;"><strong>${c}</strong>/100</div>
+          </div>`;
+        })
+        .join("")
+    : '<div class="muted">No map pool comfort data.</div>';
+}
+
+function renderHelperFinder(d) {
+  const ff = d.replacementFinder || {};
+  const ref = ff.reference || {};
+  const avail = $("finderAvailFilter").value || "all";
+  const q = ($("helperFilterQ").value || "").trim().toLowerCase();
+  const managingTid = Number(d.rosterOptimizer?.teamId || 0);
+
+  $("finderRefSubtitle").textContent = `Reference: ${ref.name || "-"} (${ref.bestRole || "-"}, ${ref.avgSkill ?? "-"} avg) • Ranked by skill upgrade, 18-skill cosine similarity, language & availability`;
+
+  const rows = (ff.candidates || []).filter((r) => {
+    if (avail === "fa_exp" && !(r.isFreeAgent || r.monthsLeft <= 12.5)) return false;
+    if (avail === "benched_fa" && !(r.isFreeAgent || r.benched)) return false;
+    if (avail === "lang_safe" && !r.speaksMainLang) return false;
+    if (avail === "policy_safe" && !r.policyOk) return false;
+    if (q && !r.name.toLowerCase().includes(q) && !r.teamName.toLowerCase().includes(q) && !r.languages.toLowerCase().includes(q)) return false;
+    return true;
+  });
+
+  $("finderCount").textContent = `${rows.length} targets`;
+  $("finderTableBody").innerHTML = rows.length
+    ? rows
+        .map((r) => {
+          const deltaCls = r.skillDelta > 0 ? "stat-good" : r.skillDelta < 0 ? "stat-bad" : "";
+          const langTag = r.speaksMainLang ? '<span class="tag-pill ok">Main Lang</span>' : '<span class="tag-pill warn">Foreign</span>';
+          const polTag = r.policyOk ? "" : '<span class="tag-pill err">Policy!</span>';
+          const statusTag = r.isFreeAgent ? '<span class="tag-pill ok">Free Agent</span>' : r.benched ? '<span class="tag-pill warn">Benched</span>' : "";
+          return `<tr>
+            <td><a href="#" class="link-btn ps-open" data-pid="${r.playerId}">${escapeHtml(r.name)}</a> <span class="muted">(${r.age}y, ${escapeHtml(r.nationName)})</span></td>
+            <td>${r.teamId > 0 ? `<a href="#" class="link-btn ts-open" data-tid="${r.teamId}">${escapeHtml(r.teamName)}</a>` : '<span class="muted">Free Agent</span>'} ${statusTag}</td>
+            <td>${escapeHtml(r.bestRole)}</td>
+            <td><strong>${r.avgSkill}</strong> <span class="muted">(${r.avgPot})</span></td>
+            <td class="${deltaCls}">${r.skillDelta >= 0 ? "+" : ""}${r.skillDelta}</td>
+            <td><strong>${r.similarityPct}%</strong></td>
+            <td>${r.salaryYear > 0 ? _fmtUsd(r.salaryYear) : "$0"} <span class="muted">(${r.isFreeAgent ? "FA" : `${r.monthsLeft}m`})</span></td>
+            <td>${langTag}${polTag}<div class="muted" style="font-size:10.5px;">${escapeHtml(r.languages)}</div></td>
+            <td><button class="btn btn-sm btn-blue btn-prep-tx" data-pid="${r.playerId}">Prep Sign</button></td>
+          </tr>`;
+        })
+        .join("")
+    : '<tr><td colspan="9" class="muted">No candidates match filters.</td></tr>';
+  _bindHelperActionButtons($("finderTableBody"), managingTid);
+}
+
+function renderHelperMarket(d) {
+  const mode = $("marketFilterMode").value || "bargains";
+  const q = ($("helperFilterQ").value || "").trim().toLowerCase();
+  const managingTid = Number(d.rosterOptimizer?.teamId || 0);
+  const raw = d.marketRadar?.[mode] || [];
+  const rows = raw.filter(
+    (r) => !q || r.name.toLowerCase().includes(q) || r.teamName.toLowerCase().includes(q) || (r.languages || "").toLowerCase().includes(q)
+  );
+  $("marketCount").textContent = `${rows.length} players`;
+  $("marketTableBody").innerHTML = rows.length
+    ? rows
+        .map((r) => {
+          const status = r.isFreeAgent
+            ? '<span class="tag-pill ok">Free Agent</span>'
+            : r.benched
+              ? '<span class="tag-pill warn">Benched</span>'
+              : r.monthsLeft <= 6
+                ? '<span class="tag-pill err">Expiring</span>'
+                : r.ratio <= 0.72
+                  ? '<span class="tag-pill ok">Bargain</span>'
+                  : '<span class="tag-pill">Active</span>';
+          const ratioCls = r.ratio > 0 && r.ratio <= 0.72 ? "stat-good" : r.ratio >= 1.55 ? "stat-bad" : "";
+          return `<tr>
+            <td><a href="#" class="link-btn ps-open" data-pid="${r.playerId}">${escapeHtml(r.name)}</a> <span class="muted">(${r.age}y &bull; ${escapeHtml(r.bestRole || "")})</span></td>
+            <td>${r.teamId > 0 ? `<a href="#" class="link-btn ts-open" data-tid="${r.teamId}">${escapeHtml(r.teamName)}</a>` : '<span class="muted">Free Agent</span>'}</td>
+            <td><strong>${r.avgSkill}</strong> <span class="muted">(${r.avgPot ?? r.avgSkill})</span></td>
+            <td>${r.yearRating > 0 ? r.yearRating.toFixed(2) : "-"}</td>
+            <td>${_fmtUsd(r.salaryYear)}</td>
+            <td class="muted">${_fmtUsd(r.peerMedianSalary)}</td>
+            <td class="${ratioCls}">${r.isFreeAgent ? "0.00x" : `${r.ratio.toFixed(2)}x`}</td>
+            <td>${escapeHtml(r.endDate)} ${r.isFreeAgent ? "" : `<span class="muted">(${r.monthsLeft}m)</span>`}</td>
+            <td>${status} <button class="btn btn-sm btn-prep-tx" data-pid="${r.playerId}">Sign</button></td>
+          </tr>`;
+        })
+        .join("")
+    : '<tr><td colspan="9" class="muted">No matching contracts in this view.</td></tr>';
+  _bindHelperActionButtons($("marketTableBody"), managingTid);
+}
+
+function renderHelperWonderkids(d) {
+  const mode = $("wonderkidFilterMode").value || "all";
+  const q = ($("helperFilterQ").value || "").trim().toLowerCase();
+  const managingTid = Number(d.rosterOptimizer?.teamId || 0);
+  const rows = (d.wonderkids || []).filter((r) => {
+    if (mode === "fa_exp" && !(r.isFreeAgent || r.monthsLeft <= 12.5)) return false;
+    if (mode === "high_headroom" && r.headroom < 2.0) return false;
+    if (mode === "lang_safe" && !r.speaksMainLang) return false;
+    if (q && !r.name.toLowerCase().includes(q) && !r.teamName.toLowerCase().includes(q) && !r.nationName.toLowerCase().includes(q) && !r.languages.toLowerCase().includes(q)) return false;
+    return true;
+  });
+  $("wonderkidCount").textContent = `${rows.length} gems`;
+  $("wonderkidTableBody").innerHTML = rows.length
+    ? rows
+        .map((r) => {
+          const teamCell = r.isFreeAgent
+            ? '<span class="tag-pill ok">Free Agent</span>'
+            : `<a href="#" class="link-btn ts-open" data-tid="${r.teamId}">${escapeHtml(r.teamName)}</a>${r.benched ? ' <span class="tag-pill warn">Bench</span>' : ""}`;
+          return `<tr>
+            <td><a href="#" class="link-btn ps-open" data-pid="${r.playerId}">${escapeHtml(r.name)}</a> <span class="muted">(${r.age}y)</span></td>
+            <td>${escapeHtml(r.nationName)}</td>
+            <td>${teamCell}</td>
+            <td>${escapeHtml(r.bestRole)}</td>
+            <td><strong>${r.avgSkill}</strong></td>
+            <td class="stat-good"><strong>${r.avgPot}</strong></td>
+            <td class="${r.headroom >= 2.0 ? "stat-good" : ""}">+${r.headroom}</td>
+            <td>${r.salaryYear > 0 ? _fmtUsd(r.salaryYear) : "$0"} <span class="muted">(${r.isFreeAgent ? "FA" : `${r.monthsLeft}m`})</span></td>
+            <td><button class="btn btn-sm btn-blue btn-prep-tx" data-pid="${r.playerId}">Scout/Sign</button></td>
+          </tr>`;
+        })
+        .join("")
+    : '<tr><td colspan="9" class="muted">No U21 wonderkids match filter.</td></tr>';
+  _bindHelperActionButtons($("wonderkidTableBody"), managingTid);
+}
+
+// ==================== GOD MODE LAB ====================
+async function loadGodMode() {
+  if (!state.summary?.path && !state.summary?.filename) return;
+  try {
+    const d = await api("/api/god-mode/state");
+    state.godModeData = d;
+    if (!d.loaded) return;
+
+    const teams = d.teams || [];
+    const curNerfTid = $("godNerfTeam").value || (teams.find((t) => t.isUserTeam)?.teamId ?? teams[0]?.teamId ?? "");
+    populateSelect(
+      $("godNerfTeam"),
+      teams.map((t) => [t.teamId, `${t.worldRank ? `#${t.worldRank} ` : ""}${t.name}${t.isUserTeam ? " (YOU)" : ""} — ${t.avgSkill} avg`]),
+      curNerfTid
+    );
+    if (d.defaultProtectedStar) {
+      $("godProtectedNames").placeholder = `e.g. ${d.defaultProtectedStar}`;
+      $("godNerfProtected").placeholder = `e.g. ${d.defaultProtectedStar}`;
+    }
+
+    const s = d.snapshot || {};
+    const kpis = [
+      { label: `${s.userTeamName || "Focus"} Avg Skill`, val: s.userAvgSkill ?? "-", sub: `Weakest floor: ${s.userFloor ?? "-"}` },
+      { label: "Top-10 Rival Avg", val: s.top10AvgSkill ?? "-", sub: `Top-20 Avg: ${s.top20AvgSkill ?? "-"}` },
+      { label: "Top-10 Skill Spread", val: s.top10Spread ?? "-", sub: `Max minus #10 floor` },
+      { label: "Top-10 Parity Gini", val: s.top10Gini ?? "-", sub: "Lower = closer Tier-1 parity" },
+      { label: "AI Bench Sabotages", val: s.aiBenchSabotagesTop20 ?? 0, sub: "Top-20 AI teams benching better player" },
+    ];
+    $("godKpiGrid").innerHTML = kpis
+      .map(
+        (k) => `<div class="kpi-card">
+          <div class="kpi-label">${escapeHtml(k.label)}</div>
+          <div class="kpi-val">${escapeHtml(k.val)}</div>
+          <div class="kpi-sub">${escapeHtml(k.sub)}</div>
+        </div>`
+      )
+      .join("");
+  } catch (err) {
+    toast(`God Mode load failed: ${err.message}`, "err");
+  }
+}
+
+function _collectGodModeParams(action) {
+  if (action === "boost_floor_parity") {
+    const val = Number($("godBoostFloor").value || 15.8);
+    return {
+      scope: $("godBoostScope").value,
+      mode: $("godBoostMode").value,
+      targetFloor: val,
+      smoothTarget: val,
+      strengthPct: Number($("godBoostStrength").value || 75),
+      boostDelta: Number($("godBoostDelta").value || 1.2),
+      protectUserTeam: $("godProtectUser").checked,
+      protectedNames: $("godProtectedNames").value,
+    };
+  }
+  if (action === "nerf_superteam_keep_stars") {
+    return {
+      teamId: Number($("godNerfTeam").value || 0),
+      targetAvg: Number($("godNerfTargetAvg").value || 16.2),
+      capNonProtected: Number($("godNerfCapNon").value || 17.0),
+      protectedNames: $("godNerfProtected").value,
+    };
+  }
+  if (action === "fix_ai_sabotage") {
+    return {
+      scope: $("godAiScope").value,
+      fixBench: $("godAiFixBench").checked,
+      minMapComfort: Number($("godAiMapComfort").value || 0),
+      syncLanguages: $("godAiSyncLang").checked,
+      minStaffSkill: Number($("godAiMinStaff").value || 0),
+      applyBurnoutToTopTeams: $("godAiBurnout").checked,
+    };
+  }
+  if (action === "rebalance_economy") {
+    return {
+      scope: $("godEconScope").value,
+      minBalance: Number($("godEconMinBal").value || 0),
+      maxBalanceCap: Number($("godEconMaxCap").value || 0),
+      minFacilityLevel: Number($("godEconMinFac").value || 0),
+    };
+  }
+  if (action === "inject_wonderkids") {
+    return {
+      count: Number($("godWkCount").value || 10),
+      maxAge: Number($("godWkMaxAge").value || 18),
+      nationMode: $("godWkNation").value,
+      assignMode: $("godWkAssign").value,
+    };
+  }
+  return {};
+}
+
+async function runGodModeAction(action, dryRun) {
+  if (!state.summary?.path && !state.summary?.filename) {
+    toast("Load a save file first.", "err");
+    return;
+  }
+  try {
+    const res = await api("/api/god-mode/apply", {
+      method: "POST",
+      body: JSON.stringify({
+        action,
+        params: _collectGodModeParams(action),
+        dryRun,
+      }),
+    });
+    const b = res.before || {};
+    const a = res.after || {};
+    const tag = res.dryRun ? "PREVIEW (Not Applied Yet)" : "APPLIED TO MEMORY (Click Save to Write)";
+    $("godResultCount").textContent = `${res.changeCount || 0} changes (${res.dryRun ? "Dry Run" : "Live"})`;
+    $("godResultBanner").className = `verdict-banner ${res.dryRun ? "warn" : "ok"}`;
+    $("godResultBanner").innerHTML = `<div class="verdict-headline">${tag} — ${escapeHtml(res.summary || "")}</div>
+      <div>
+        <strong>${escapeHtml(a.userTeamName || "Focus")}:</strong> ${b.userAvgSkill} &rarr; <strong>${a.userAvgSkill}</strong> avg (floor ${b.userFloor} &rarr; ${a.userFloor}) &bull;
+        <strong>Top-10 Avg:</strong> ${b.top10AvgSkill} &rarr; <strong>${a.top10AvgSkill}</strong> &bull;
+        <strong>Top-10 Spread:</strong> ${b.top10Spread} &rarr; <strong>${a.top10Spread}</strong> &bull;
+        <strong>AI Bench Bugs:</strong> ${b.aiBenchSabotagesTop20} &rarr; <strong>${a.aiBenchSabotagesTop20}</strong>
+      </div>`;
+
+    const rows = res.changes || [];
+    $("godResultTableBody").innerHTML = rows.length
+      ? rows
+          .map(
+            (c) => `<tr>
+              <td><strong>${escapeHtml(c.target)}</strong></td>
+              <td>${escapeHtml(c.team)}</td>
+              <td>${escapeHtml(c.detail)}</td>
+            </tr>`
+          )
+          .join("")
+      : '<tr><td colspan="3" class="muted">No adjustments were needed for the chosen thresholds.</td></tr>';
+
+    if (!res.dryRun) {
+      toast(`${res.summary}`, "ok");
+      await refreshSummaryOnly();
+      await refreshAllViews();
+      await loadGodMode();
+    } else {
+      toast(`Previewed ${res.changeCount} change(s) — click Apply to commit to memory`, "info");
+    }
+  } catch (err) {
+    toast(`God Mode error: ${err.message}`, "err");
   }
 }
 

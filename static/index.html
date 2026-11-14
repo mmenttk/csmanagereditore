@@ -16,8 +16,7 @@
       <div class="save-controls">
         <select id="savePicker" class="save-select" title="Discovered saves"></select>
         <button id="btnLoadSelected" class="btn">Load</button>
-        <button id="btnBrowsePath" class="btn" title="Open file picker (native Explorer/Finder on desktop, or upload on mobile/remote)">Browse File...</button>
-        <button id="btnUploadSave" class="btn" title="Upload a .json save from your browser/device">Upload .json</button>
+        <button id="btnBrowsePath" class="btn" title="Open a .json save (native file picker on desktop, browser file upload on mobile/remote or fallback)">Browse / Upload .json...</button>
         <input id="uploadSaveInput" type="file" accept=".json,application/json" hidden />
         <button id="btnOpenFolder" class="btn" title="Open save folder on host desktop">Open Folder</button>
         <button id="btnValidate" class="btn btn-blue">Validate &amp; Fix</button>
@@ -38,6 +37,9 @@
     <button class="tab-btn" data-tab="teams">Orgs / Teams</button>
     <button class="tab-btn" data-tab="stats">Stats</button>
     <button class="tab-btn" data-tab="showcase">Bug Showcase</button>
+    <button class="tab-btn" data-tab="realism">Data Science</button>
+    <button class="tab-btn" data-tab="helper">Manager Helper</button>
+    <button class="tab-btn" data-tab="godmode">God Mode</button>
   </nav>
 
   <main class="container">
@@ -55,7 +57,7 @@
             <div class="form-grid-2">
               <div class="field">
                 <label>Filter Player Name / ID</label>
-                <input id="txPlayerSearch" type="text" placeholder="Type e.g. YEKINDAR, donk, m0NESY..." />
+                <input id="txPlayerSearch" type="text" placeholder="Filter by player name, team, or ID..." />
               </div>
               <div class="field">
                 <label>Select Player</label>
@@ -631,6 +633,7 @@
         <button class="subtab-btn" data-bsubtab="awards">Undeserved MVPs &amp; EVPs</button>
         <button class="subtab-btn" data-bsubtab="transfers">Unexplainable AI Transfers &amp; Benches</button>
         <button class="subtab-btn" data-bsubtab="stability">We Don&apos;t Believe In Squad Stability</button>
+        <button class="subtab-btn" data-bsubtab="findings">Root Causes &amp; Game Findings</button>
       </div>
 
       <!-- Subtab: Blowouts -->
@@ -650,13 +653,6 @@
             </div>
             <div id="scStreakBars"></div>
           </div>
-        </div>
-
-        <div class="card">
-          <div class="card-header">
-            <h3 class="card-title">Engine Root Causes (<span class="mono">Assembly-CSharp.dll</span>)</h3>
-          </div>
-          <div class="bug-cause-grid" id="scBlowoutCauses"></div>
         </div>
 
         <div class="card">
@@ -731,13 +727,6 @@
 
       <!-- Subtab: Unexplainable AI Transfers -->
       <div id="bsubtab-transfers" class="bsubtab-panel">
-        <div class="card">
-          <div class="card-header">
-            <h3 class="card-title">Engine Root Causes (AI Roster &amp; Transfer Logic)</h3>
-          </div>
-          <div class="bug-cause-grid" id="scTransferCauses"></div>
-        </div>
-
         <div class="card">
           <div class="card-header">
             <h3 class="card-title">Current Bench Crimes <span class="muted" style="font-weight:400;font-size:12px;">(Teams benching higher-skilled players than an active starter)</span></h3>
@@ -821,20 +810,12 @@
 
       <!-- Subtab: We Don't Believe In Squad Stability -->
       <div id="bsubtab-stability" class="bsubtab-panel">
-        <div class="two-col">
-          <div class="card">
-            <div class="card-header">
-              <h3 class="card-title">Post-Transfer Stint vs CS2 Pro Low-End (6.0 Months)</h3>
-              <span id="scStabilitySummaryTag" class="badge"></span>
-            </div>
-            <div id="scStabilityBars"></div>
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title">Post-Transfer Stint vs CS2 Pro Low-End (6.0 Months)</h3>
+            <span id="scStabilitySummaryTag" class="badge"></span>
           </div>
-          <div class="card">
-            <div class="card-header">
-              <h3 class="card-title">Why AI Orgs Have Zero Patience</h3>
-            </div>
-            <div class="bug-cause-grid" id="scStabilityCauses"></div>
-          </div>
+          <div id="scStabilityBars"></div>
         </div>
 
         <div class="card">
@@ -884,6 +865,655 @@
           </div>
         </div>
       </div>
+
+      <!-- Subtab: Combined Root Causes & Game Findings -->
+      <div id="bsubtab-findings" class="bsubtab-panel">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">Complete Bug Root Causes &amp; Decompiled Game Findings</h3>
+              <div class="muted" style="font-size:12px;">Unified dossier combining reverse-engineered <span class="mono">Assembly-CSharp.dll</span> mechanics, save-format pitfalls, live impact in this save, and suggested fixes.</div>
+            </div>
+            <span id="scFindingsCount" class="pill">13 findings</span>
+          </div>
+          <div id="scFindingsContainer"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== DATA SCIENCE TAB ==================== -->
+    <section id="tab-realism" class="tab-panel">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <h2 class="card-title">Data Science Lab — Strength Diff, Realism, Regressions &amp; Parity</h2>
+            <div class="muted" style="font-size:12px;">Statistical modeling across the save: 12-metric roster diffs, CS2 trophy realism &amp; odds calibration, skill&rarr;rating OLS regressions, age curves, and league Gini parity.</div>
+          </div>
+          <button id="btnRealismRefresh" class="btn btn-sm btn-blue">Refresh Analytics</button>
+        </div>
+        <div class="filter-row">
+          <div class="field"><label>Season Year</label><select id="realismFilterYear"></select></div>
+          <div class="field"><label>Audit Focus Team</label><select id="realismFocusTeam"></select></div>
+          <div class="field"><label>Search Team / Player</label><input id="realismFilterQ" type="text" placeholder="Filter by team or player..." /></div>
+        </div>
+      </div>
+
+      <div class="kpi-grid" id="realismKpiGrid"></div>
+
+      <div class="subtabs">
+        <button class="subtab-btn active" data-rsubtab="diff">Team Strength Diff</button>
+        <button class="subtab-btn" data-rsubtab="trophies">Trophy Realism Audit</button>
+        <button class="subtab-btn" data-rsubtab="matchup">Matchup Odds Lab</button>
+        <button class="subtab-btn" data-rsubtab="regression">Regression &amp; Age Curve</button>
+        <button class="subtab-btn" data-rsubtab="parity">Parity, Gini &amp; Nation Meta</button>
+      </div>
+
+      <!-- Subtab 1: Team Strength Diff -->
+      <div id="rsubtab-diff" class="rsubtab-panel active">
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title">Head-to-Head Team Strength Comparator</h3>
+            <div class="inline-actions">
+              <div class="field" style="min-width:170px;"><label>Team A</label><select id="diffTeamA"></select></div>
+              <button id="btnDiffSwap" class="btn btn-sm" title="Swap Team A & B">&harr; Swap</button>
+              <div class="field" style="min-width:170px;"><label>Team B (or Field)</label><select id="diffTeamB"></select></div>
+            </div>
+          </div>
+          <div id="diffH2HSummary" class="verdict-banner"></div>
+          <div class="two-col" style="margin-top:12px;">
+            <div>
+              <h4 class="subcard-title" style="margin:0 0 8px;">12-Metric Tug-of-War Diff</h4>
+              <div id="diffH2HBars"></div>
+            </div>
+            <div>
+              <h4 class="subcard-title" style="margin:0 0 8px;">Starting 5 Side-by-Side (Role Rating &amp; Avg Skill)</h4>
+              <div id="diffH2HRosters"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:14px;">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">Global Team Strength &amp; Gap Power Table</h3>
+              <div class="muted" style="font-size:12px;">Click column headers to sort &bull; Click &ldquo;Compare&rdquo; to load any team as Team B above</div>
+            </div>
+            <span id="diffTableCount" class="muted">0</span>
+          </div>
+          <div class="table-wrap" style="max-height:66vh;">
+            <table>
+              <thead>
+                <tr>
+                  <th class="sortable sort-active" data-rsort="worldRank">Rank</th>
+                  <th class="sortable" data-rsort="name">Team</th>
+                  <th class="sortable" data-rsort="avgSkill">Avg Skill</th>
+                  <th class="sortable" data-rsort="gapVsRank1">Gap vs #1</th>
+                  <th class="sortable" data-rsort="bestStarSkill">Star / Floor</th>
+                  <th class="sortable" data-rsort="mechanicsAvg">Mech / Ment / Wpn</th>
+                  <th class="sortable" data-rsort="staffAvgSkill">Staff Avg</th>
+                  <th class="sortable" data-rsort="cohesionAvg">Cohesion</th>
+                  <th class="sortable" data-rsort="mapReadinessAvg">Map Prep</th>
+                  <th class="sortable" data-rsort="gameOddsVsRank1">Odds vs #1</th>
+                  <th class="sortable" data-rsort="winPct">Actual Win%</th>
+                  <th class="sortable" data-rsort="trophiesCount">Titles</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="diffTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Subtab 2: Trophy Realism Audit -->
+      <div id="rsubtab-trophies" class="rsubtab-panel">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title" id="realismVerdictTitle">Season Dominance &amp; Trophy Realism Audit</h3>
+              <div class="muted" style="font-size:12px;">Compares actual trophy haul, match win rate, and pre-match odds defiance against CS2 Tier-1 pro history.</div>
+            </div>
+            <span id="realismVerdictPill" class="pill"></span>
+          </div>
+          <div id="realismVerdictBanner" class="verdict-banner"></div>
+          <div id="realismReasonsGrid" class="bug-cause-grid" style="margin-top:12px;"></div>
+        </div>
+
+        <div class="two-col" style="margin-top:14px;">
+          <div class="card">
+            <div class="card-header">
+              <h3 class="card-title">Odds Calibration: Pre-Match Expected vs Actual Win%</h3>
+              <span class="muted" style="font-size:12px;">All season matches</span>
+            </div>
+            <div id="realismCalBars"></div>
+            <div class="table-wrap" style="margin-top:10px;">
+              <table>
+                <thead>
+                  <tr><th>Format</th><th>Matches</th><th>Avg Pre-Match Odds</th><th>Actual Fav Win%</th><th>Overperf</th></tr>
+                </thead>
+                <tbody id="realismFormatBody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3 class="card-title">League Trophy Concentration Leaderboard</h3>
+              <span id="realismChampCount" class="muted">0</span>
+            </div>
+            <div class="table-wrap" style="max-height:46vh;">
+              <table>
+                <thead>
+                  <tr><th>Team</th><th>Rank</th><th>Avg Skill</th><th>Total Titles</th><th>Tier-1 Titles (Share)</th><th>Win% (Max Streak)</th></tr>
+                </thead>
+                <tbody id="realismLeagueBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:14px;">
+          <div class="card-header">
+            <h3 class="card-title" id="realismHaulTitle">Focus Team's Trophy Haul &amp; Winning Lineups</h3>
+            <span id="realismHaulCount" class="muted">0</span>
+          </div>
+          <div class="table-wrap" style="max-height:48vh;">
+            <table>
+              <thead>
+                <tr><th>Split</th><th>Tournament</th><th>Rep</th><th>Tier</th><th>Winning 5-Man Lineup</th></tr>
+              </thead>
+              <tbody id="realismHaulBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Subtab 3: Matchup Odds Lab -->
+      <div id="rsubtab-matchup" class="rsubtab-panel">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">Interactive What-If Matchup Simulator &amp; Odds Lab</h3>
+              <div class="muted" style="font-size:12px;">Computes exact game odds (MiscFunctions::GetOddsOfWinning with skill^2.8 &times; GetComfortMultiplier) plus BO1/BO3/BO5 empirical win probability.</div>
+            </div>
+          </div>
+          <div class="filter-row">
+            <div class="field"><label>Team 1</label><select id="labTeam1"></select></div>
+            <div class="field"><label>Team 2</label><select id="labTeam2"></select></div>
+            <div class="field"><label>Map</label><select id="labMap"></select></div>
+            <div class="field">
+              <label>Series Format</label>
+              <select id="labFormat">
+                <option value="1">BO1 (Single Map)</option>
+                <option value="3" selected>BO3 (Standard Series)</option>
+                <option value="5">BO5 (Grand Final)</option>
+              </select>
+            </div>
+          </div>
+          <div id="labResultPanel" style="margin-top:12px;"></div>
+        </div>
+      </div>
+
+      <!-- Subtab 4: Regression & Age Curve -->
+      <div id="rsubtab-regression" class="rsubtab-panel">
+        <div class="two-col">
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h3 class="card-title">Skill &rarr; Season Rating Drivers (Pearson r)</h3>
+                <div class="muted" id="regOlsSubtitle" style="font-size:12px;">Which attributes correlate most strongly with actual HLTV/game rating.</div>
+              </div>
+              <span id="regSamplePill" class="pill">0 players</span>
+            </div>
+            <div id="regSkillBars"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h3 class="card-title">Empirical Age Curve &amp; Potential Headroom</h3>
+                <div class="muted" style="font-size:12px;">Average skill, potential cap, remaining growth headroom, and rated performance by age bracket.</div>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>Age Group</th><th>Players</th><th>Avg Skill</th><th>Avg Pot</th><th>Headroom</th><th>Avg Rating</th></tr>
+                </thead>
+                <tbody id="regAgeCurveBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="two-col" style="margin-top:14px;">
+          <div class="card">
+            <div class="card-header">
+              <h3 class="card-title">Top Statistical Overperformers (+Residual)</h3>
+              <span class="muted" style="font-size:12px;">Actual Rating minus OLS Expected</span>
+            </div>
+            <div class="table-wrap" style="max-height:48vh;">
+              <table>
+                <thead>
+                  <tr><th>Player</th><th>Team</th><th>Avg Skill</th><th>Exp</th><th>Actual</th><th>Residual</th></tr>
+                </thead>
+                <tbody id="regOverBody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3 class="card-title">Biggest Underperformers (-Residual)</h3>
+              <span class="muted" style="font-size:12px;">Slumping stars / role mismatches</span>
+            </div>
+            <div class="table-wrap" style="max-height:48vh;">
+              <table>
+                <thead>
+                  <tr><th>Player</th><th>Team</th><th>Avg Skill</th><th>Exp</th><th>Actual</th><th>Residual</th></tr>
+                </thead>
+                <tbody id="regUnderBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Subtab 5: Parity, Gini & Nation Meta -->
+      <div id="rsubtab-parity" class="rsubtab-panel">
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title">League Inequality &amp; Distribution Percentiles (Gini)</h3>
+            <span class="muted" style="font-size:12px;">0.00 = perfect equality &bull; 1.00 = extreme concentration</span>
+          </div>
+          <div id="parityDistGrid" class="lab-grid"></div>
+        </div>
+
+        <div class="two-col" style="margin-top:14px;">
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h3 class="card-title">What Actually Drives Team Win%? (Pearson r)</h3>
+                <div class="muted" style="font-size:12px;">Correlations across active teams (&ge;8 season matches).</div>
+              </div>
+              <span id="parityTeamSample" class="pill">0 teams</span>
+            </div>
+            <div id="parityTeamCorrBars"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3 class="card-title">Talent Pipeline by Nation Meta</h3>
+              <span class="muted" style="font-size:12px;">Ranked by 16+ skill elites</span>
+            </div>
+            <div class="table-wrap" style="max-height:48vh;">
+              <table>
+                <thead>
+                  <tr><th>Nation</th><th>Players</th><th>16+ Elites</th><th>Avg Skill</th><th>Avg Pot</th><th>Avg Rating</th></tr>
+                </thead>
+                <tbody id="parityNationBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== MANAGER HELPER TAB ==================== -->
+    <section id="tab-helper" class="tab-panel">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <h2 class="card-title">Manager Helper Lab — Roster Optimizer, Replacement Finder &amp; Market Radar</h2>
+            <div class="muted" style="font-size:12px;">Practical GM workbench: optimize roles &amp; map pool, find Moneyball replacements, snipe contract bargains/free agents, and scout U21 wonderkids.</div>
+          </div>
+          <button id="btnHelperRefresh" class="btn btn-sm btn-blue">Refresh Helper</button>
+        </div>
+        <div class="filter-row">
+          <div class="field"><label>Managing Team</label><select id="helperTeamSelect"></select></div>
+          <div class="field"><label>Search Player / Team / Language</label><input id="helperFilterQ" type="text" placeholder="Filter by player, team, nation or language..." /></div>
+        </div>
+      </div>
+
+      <div class="kpi-grid" id="helperKpiGrid"></div>
+
+      <div class="subtabs">
+        <button class="subtab-btn active" data-hsubtab="roster">Roster Optimizer</button>
+        <button class="subtab-btn" data-hsubtab="finder">Moneyball Replacement Finder</button>
+        <button class="subtab-btn" data-hsubtab="market">Market &amp; Contract Radar</button>
+        <button class="subtab-btn" data-hsubtab="wonderkids">Wonderkid &amp; Gem Scout</button>
+      </div>
+
+      <!-- Helper Subtab 1: Roster Optimizer -->
+      <div id="hsubtab-roster" class="hsubtab-panel active">
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title" id="helperOptTitle">Actionable GM Diagnostics</h3>
+            <span id="helperPolicyPill" class="pill">Policy</span>
+          </div>
+          <div id="helperAlertsList" class="bug-cause-grid"></div>
+        </div>
+
+        <div class="two-col" style="margin-top:14px;">
+          <div class="card">
+            <div class="card-header">
+              <h3 class="card-title">Contracted Squad: Role Fit, Language &amp; Ceiling</h3>
+              <span id="helperSquadCount" class="muted">0 players</span>
+            </div>
+            <div class="table-wrap" style="max-height:52vh;">
+              <table>
+                <thead>
+                  <tr><th>Player</th><th>Status</th><th>Role</th><th>Skill / Pot</th><th>IGL / AWP</th><th>Languages</th><th>Wage</th><th>Action</th></tr>
+                </thead>
+                <tbody id="helperRosterBody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3 class="card-title">Map Pool Comfort (Weakest &rarr; Strongest)</h3>
+              <span class="muted" style="font-size:12px;">Target lowest maps in training/scrims</span>
+            </div>
+            <div id="helperMapBars"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Helper Subtab 2: Moneyball Replacement Finder -->
+      <div id="hsubtab-finder" class="hsubtab-panel">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">Moneyball Replacement Finder</h3>
+              <div class="muted" id="finderRefSubtitle" style="font-size:12px;">Scores replacements by 18-skill cosine similarity, skill upgrade, language fit, and contract availability.</div>
+            </div>
+            <span id="finderCount" class="muted">0 candidates</span>
+          </div>
+          <div class="filter-row">
+            <div class="field"><label>Replace Starter / Reference</label><select id="finderTargetPlayer"></select></div>
+            <div class="field">
+              <label>Or Role Template</label>
+              <select id="finderRolePreset">
+                <option value="match">Match Selected Player Profile</option>
+                <option value="awper">Elite AWPer Template</option>
+                <option value="igl">Tactical IGL Template</option>
+                <option value="entry">Aggressive Entry Template</option>
+                <option value="support">Utility Support Template</option>
+                <option value="rifler">Star Rifler Template</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>Availability Filter</label>
+              <select id="finderAvailFilter">
+                <option value="all">All Targets</option>
+                <option value="fa_exp">Free Agents or &le;12m Left</option>
+                <option value="benched_fa">Free Agents or Benched</option>
+                <option value="lang_safe">Speaks Team Main Lang Only</option>
+                <option value="policy_safe">Safe for Club Policy Only</option>
+              </select>
+            </div>
+          </div>
+          <div class="table-wrap" style="max-height:60vh;margin-top:10px;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Candidate</th>
+                  <th>Current Team</th>
+                  <th>Role</th>
+                  <th>Avg Skill (Pot)</th>
+                  <th>Skill &Delta;</th>
+                  <th>Similarity</th>
+                  <th>Wage / Ends</th>
+                  <th>Lang Fit</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="finderTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Helper Subtab 3: Market & Contract Radar -->
+      <div id="hsubtab-market" class="hsubtab-panel">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">Market &amp; Contract Radar</h3>
+              <div class="muted" style="font-size:12px;">Scout underpaid bargains, high-skill free agents, overpaid/benched wages, and expiring deals (&le;12 months).</div>
+            </div>
+            <div class="inline-actions">
+              <select id="marketFilterMode" style="width:auto;">
+                <option value="bargains">Best Bargains (Underpaid Starters)</option>
+                <option value="freeAgents">Top Free Agents ($0 Transfer)</option>
+                <option value="expiring">Expiring Within 12 Months</option>
+                <option value="overpaid">Most Overpaid / Benched Wages</option>
+              </select>
+              <span id="marketCount" class="muted">0</span>
+            </div>
+          </div>
+          <div class="table-wrap" style="max-height:64vh;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Player (Age)</th>
+                  <th>Team</th>
+                  <th>Avg Skill</th>
+                  <th>Rating</th>
+                  <th>Salary / Yr</th>
+                  <th>Tier Median</th>
+                  <th>Ratio</th>
+                  <th>Contract Ends</th>
+                  <th>Status / Action</th>
+                </tr>
+              </thead>
+              <tbody id="marketTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Helper Subtab 4: Wonderkid & Hidden Gem Scout -->
+      <div id="hsubtab-wonderkids" class="hsubtab-panel">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">Wonderkid &amp; Hidden Gem Scout (U21)</h3>
+              <div class="muted" style="font-size:12px;">Players age &le;21 ranked by potential ceiling, remaining growth headroom, and availability.</div>
+            </div>
+            <div class="inline-actions">
+              <select id="wonderkidFilterMode" style="width:auto;">
+                <option value="all">All U21 Gems</option>
+                <option value="fa_exp">Free Agents or &le;12m Expiring</option>
+                <option value="high_headroom">+2.0+ Growth Headroom Only</option>
+                <option value="lang_safe">Speaks Team Main Language</option>
+              </select>
+              <span id="wonderkidCount" class="muted">0 gems</span>
+            </div>
+          </div>
+          <div class="table-wrap" style="max-height:64vh;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Player (Age)</th>
+                  <th>Nation</th>
+                  <th>Team</th>
+                  <th>Role</th>
+                  <th>Current Skill</th>
+                  <th>Potential Cap</th>
+                  <th>Headroom</th>
+                  <th>Salary / Ends</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="wonderkidTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== GOD MODE TAB ==================== -->
+    <section id="tab-godmode" class="tab-panel">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <h2 class="card-title">God Mode — League Parity Balancer, Smoothing, Floor Booster &amp; AI Fixer</h2>
+            <div class="muted" style="font-size:12px;">Rebalance dominance, boost rival floors, protect chosen star player(s), fix AI bench sabotage &amp; spawn wonderkids. Edits stay in memory until you click <strong>Save</strong> or <strong>Download .json</strong>.</div>
+          </div>
+          <button id="btnGodRefresh" class="btn btn-sm btn-blue">Refresh Parity Snapshot</button>
+        </div>
+      </div>
+
+      <div class="kpi-grid" id="godKpiGrid"></div>
+
+      <div class="two-col">
+        <!-- Card 1: Floor Booster & League Compression -->
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">1. League Floor Boost &amp; Skill Smoothing</h3>
+              <div class="muted" style="font-size:12px;">Lift weak rival starters to a realistic floor or compress the gap across Top-10 / Top-20 teams.</div>
+            </div>
+          </div>
+          <div class="form-grid">
+            <div class="field">
+              <label>Target Scope</label>
+              <select id="godBoostScope">
+                <option value="top10">Top 10 Teams</option>
+                <option value="top20" selected>Top 20 Teams</option>
+                <option value="top30">Top 30 Teams</option>
+                <option value="all_active">All Active Teams</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>Adjustment Mode</label>
+              <select id="godBoostMode">
+                <option value="floor" selected>Boost Players Below Floor</option>
+                <option value="smooth_toward_target">Compress Teams Toward Target Avg</option>
+                <option value="weakest_slot_boost">Boost Each Team's 2 Weakest Slots</option>
+              </select>
+            </div>
+            <div class="field"><label>Floor / Compress Target (1-20)</label><input id="godBoostFloor" type="number" step="0.2" min="10" max="19.5" value="15.8" /></div>
+            <div class="field"><label>Smooth Blend % (10-100)</label><input id="godBoostStrength" type="number" step="5" min="10" max="100" value="75" /></div>
+            <div class="field"><label>Weakest-Slot Delta (+Skill)</label><input id="godBoostDelta" type="number" step="0.2" min="0.2" max="5" value="1.2" /></div>
+            <div class="field"><label>Protected Star Names (comma-sep)</label><input id="godProtectedNames" type="text" placeholder="e.g. TopStar1, TopStar2" /></div>
+          </div>
+          <label style="display:flex;align-items:center;gap:8px;margin:8px 0 12px;font-size:12.5px;">
+            <input id="godProtectUser" type="checkbox" checked style="width:auto;" /> Keep User Team untouched (only buff AI rivals)
+          </label>
+          <div class="inline-actions">
+            <button id="btnGodBoostPreview" class="btn btn-sm">Preview Changes</button>
+            <button id="btnGodBoostApply" class="btn btn-sm btn-primary">Apply Floor / Smoothing</button>
+          </div>
+        </div>
+
+        <!-- Card 2: Smooth Superteam While Protecting Favorite Stars -->
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">2. Smooth Superteam (Keep Star OP!)</h3>
+              <div class="muted" style="font-size:12px;">Lower a dominant team's average to realistic Tier-1 parity while keeping chosen star player(s) completely untouched.</div>
+            </div>
+          </div>
+          <div class="form-grid">
+            <div class="field"><label>Target Team</label><select id="godNerfTeam"></select></div>
+            <div class="field"><label>Target 5-Man Team Avg (12-19)</label><input id="godNerfTargetAvg" type="number" step="0.1" min="12" max="19" value="16.2" /></div>
+            <div class="field"><label>Max Non-Protected Starter Cap</label><input id="godNerfCapNon" type="number" step="0.2" min="12" max="20" value="17.0" /></div>
+            <div class="field"><label>Protected Stars (Untouched)</label><input id="godNerfProtected" type="text" placeholder="e.g. TopStar1" /></div>
+          </div>
+          <div class="inline-actions" style="margin-top:12px;">
+            <button id="btnGodNerfPreview" class="btn btn-sm">Preview Superteam Smooth</button>
+            <button id="btnGodNerfApply" class="btn btn-sm btn-primary">Apply Team Smoothing</button>
+          </div>
+        </div>
+
+        <!-- Card 3: AI Sabotage, Map Prep & Burnout Fixer -->
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">3. AI Sabotage, Map Prep &amp; Burnout Fixer</h3>
+              <div class="muted" style="font-size:12px;">Stops AI rivals from throwing matches by fixing benching bugs, weak map pools, language clashes &amp; fatigue.</div>
+            </div>
+          </div>
+          <div class="form-grid">
+            <div class="field">
+              <label>AI Rival Scope</label>
+              <select id="godAiScope">
+                <option value="top10">Top 10 Rivals</option>
+                <option value="top20" selected>Top 20 Rivals</option>
+                <option value="all_active">All Active Rivals</option>
+              </select>
+            </div>
+            <div class="field"><label>Min Rival Map Comfort (0=skip)</label><input id="godAiMapComfort" type="number" step="5" min="0" max="90" value="68" /></div>
+            <div class="field"><label>Min AI Staff Skill (0=skip)</label><input id="godAiMinStaff" type="number" step="0.5" min="0" max="19" value="15.5" /></div>
+          </div>
+          <div style="display:flex;flex-wrap:wrap;gap:14px;margin:10px 0 12px;font-size:12.5px;">
+            <label style="display:flex;align-items:center;gap:6px;"><input id="godAiFixBench" type="checkbox" checked style="width:auto;" /> Promote Better Benched Players + Rebuild Tactics</label>
+            <label style="display:flex;align-items:center;gap:6px;"><input id="godAiSyncLang" type="checkbox" checked style="width:auto;" /> Sync Starters' Main Language (&ge;16)</label>
+            <label style="display:flex;align-items:center;gap:6px;"><input id="godAiBurnout" type="checkbox" style="width:auto;" /> Apply Realistic Travel Fatigue to Top-3</label>
+          </div>
+          <div class="inline-actions">
+            <button id="btnGodAiPreview" class="btn btn-sm">Preview AI Fixes</button>
+            <button id="btnGodAiApply" class="btn btn-sm btn-primary">Fix AI Sabotage</button>
+          </div>
+        </div>
+
+        <!-- Card 4: Economy Equalizer + Wonderkid Wave -->
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">4. Economy Equalizer &amp; Wonderkid Wave</h3>
+              <div class="muted" style="font-size:12px;">Balance org budgets/facilities or inject U18–U20 future stars into the ecosystem.</div>
+            </div>
+          </div>
+          <div class="subcard">
+            <div class="subcard-title">Finances &amp; Facilities</div>
+            <div class="form-grid-3">
+              <div class="field"><label>Scope</label><select id="godEconScope"><option value="top10">Top 10</option><option value="top20" selected>Top 20</option><option value="top30">Top 30</option></select></div>
+              <div class="field"><label>Min AI Cash ($)</label><input id="godEconMinBal" type="number" step="250000" min="0" value="1500000" /></div>
+              <div class="field"><label>Max Cash Cap (0=off)</label><input id="godEconMaxCap" type="number" step="500000" min="0" value="0" /></div>
+              <div class="field"><label>Min AI Facility Lv (0-4)</label><input id="godEconMinFac" type="number" min="0" max="4" value="3" /></div>
+            </div>
+            <div class="inline-actions" style="margin-top:8px;">
+              <button id="btnGodEconPreview" class="btn btn-sm">Preview Economy</button>
+              <button id="btnGodEconApply" class="btn btn-sm btn-blue">Apply Economy</button>
+            </div>
+          </div>
+
+          <div class="subcard" style="margin-top:10px;margin-bottom:0;">
+            <div class="subcard-title">Wonderkid Regen Wave Spawner</div>
+            <div class="form-grid-3">
+              <div class="field"><label>Count (1-25)</label><input id="godWkCount" type="number" min="1" max="25" value="10" /></div>
+              <div class="field"><label>Max Age</label><input id="godWkMaxAge" type="number" min="16" max="21" value="18" /></div>
+              <div class="field"><label>Region</label><select id="godWkNation"><option value="diverse_pro">Mixed Global</option><option value="eu">Europe</option><option value="cis">CIS</option><option value="americas">Americas</option><option value="asia">Asia/OCE</option></select></div>
+              <div class="field"><label>Destination</label><select id="godWkAssign"><option value="free_agents">Free Agents</option><option value="top20_bench">Top-20 AI Benches</option></select></div>
+            </div>
+            <div class="inline-actions" style="margin-top:8px;">
+              <button id="btnGodWkPreview" class="btn btn-sm">Preview Regens</button>
+              <button id="btnGodWkApply" class="btn btn-sm btn-blue">Spawn Wonderkids</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- God Mode Diff & Change Log -->
+      <div class="card" style="margin-top:14px;">
+        <div class="card-header">
+          <h3 class="card-title">God Mode Preview / Execution Log</h3>
+          <span id="godResultCount" class="muted">No actions run yet</span>
+        </div>
+        <div id="godResultBanner" class="verdict-banner">Run a <strong>Preview</strong> or <strong>Apply</strong> above to inspect Before &rarr; After league parity and exact player modifications.</div>
+        <div class="table-wrap" style="max-height:42vh;margin-top:10px;">
+          <table>
+            <thead>
+              <tr><th>Target</th><th>Team</th><th>Change Detail</th></tr>
+            </thead>
+            <tbody id="godResultTableBody"></tbody>
+          </table>
+        </div>
+      </div>
     </section>
   </main>
 
@@ -913,7 +1543,7 @@
         <div class="subcard">
           <div class="subcard-title">Player Details</div>
           <div class="form-grid">
-            <div class="field"><label>Alias / Name *</label><input id="npName" type="text" placeholder="e.g. s1mple2" /></div>
+            <div class="field"><label>Alias / Name *</label><input id="npName" type="text" placeholder="e.g. Player Alias" /></div>
             <div class="field"><label>Age</label><input id="npAge" type="number" min="15" max="55" value="18" /></div>
             <div class="field"><label>Nation</label><select id="npNation"></select></div>
             <div class="field"><label>Reputation (1-20)</label><input id="npRep" type="number" min="1" max="20" value="12" /></div>
@@ -974,7 +1604,7 @@
         <div class="subcard">
           <div class="subcard-title">Staff Details</div>
           <div class="form-grid">
-            <div class="field"><label>Name / Alias *</label><input id="nsName" type="text" placeholder="e.g. zonic2" /></div>
+            <div class="field"><label>Name / Alias *</label><input id="nsName" type="text" placeholder="e.g. Coach Name" /></div>
             <div class="field"><label>Age</label><input id="nsAge" type="number" min="20" max="85" value="32" /></div>
             <div class="field"><label>Nation</label><select id="nsNation"></select></div>
             <div class="field"><label>Reputation (1-20)</label><input id="nsRep" type="number" min="1" max="20" value="14" /></div>

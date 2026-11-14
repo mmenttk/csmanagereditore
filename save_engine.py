@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import datetime as dt
 import json
+import math
 import os
 import random
 import shutil
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from gamedata import (
+    HIRING_BIAS,
     LANGUAGES,
     MAP_POS_TO_PLAYER_ATTR,
     MAP_TACTIC_POSITIONS,
@@ -2853,6 +2855,7 @@ class SaveSession:
         awards = self._showcase_awards()
         transfers = self._showcase_transfers()
         stability = self._showcase_stability()
+        findings = self._showcase_findings(blowouts, awards, transfers, stability)
 
         return {
             "loaded": True,
@@ -2860,7 +2863,164 @@ class SaveSession:
             "awards": awards,
             "transfers": transfers,
             "stability": stability,
+            "findings": findings,
         }
+
+    def _showcase_findings(
+        self,
+        blowouts: dict[str, Any],
+        awards: dict[str, Any],
+        transfers: dict[str, Any],
+        stability: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Assemble unified decompiled-engine + empirical-save root causes dossier."""
+        b = blowouts
+        a = awards
+        t = transfers
+        s = stability
+        return [
+            {
+                "category": "Match & Round Simulation (Blowouts & Snowballs)",
+                "tag": "Combat / Economy / Odds",
+                "items": [
+                    {
+                        "id": "combat-helmet",
+                        "severity": "critical",
+                        "title": "1. Broken Helmet Damage Overwrite",
+                        "symbol": "Weapon::CalculateDamage (Assembly-CSharp.dll)",
+                        "liveImpact": f"{b.get('shutouts13_0', 0)} shutout 13-0 maps ({b.get('shutoutPct', 0)}%, {b.get('shutoutMultiplier', 0)}x pro avg) & {b.get('halves12_0', 0)} 12-0 halves.",
+                        "rootCause": "When a target has a helmet, damage is overwritten directly with `damage * armorMultiplier` — wiping out the headshot multiplier and distance dropoff. Armored winners take ~27 dmg from an AK headshot while unhelmeted broke defenders take ~144.",
+                        "devFix": "Apply `damage *= armorMultiplier` *after* headshot and range multipliers while keeping helmet penetration realistic instead of resetting the base scalar.",
+                    },
+                    {
+                        "id": "post-plant-copypaste",
+                        "severity": "critical",
+                        "title": "2. Post-Plant Retake Probability Copy-Paste Bug",
+                        "symbol": "SimulationManager::CheckForRoundOverAndPostPlantInitiation",
+                        "liveImpact": f"Even-odds T-side rounds win {b.get('closeTWinPct', 0)}% (Pistol R1: {b.get('closeR1TWinPct', 0)}%).",
+                        "rootCause": "Stage 5 computes `atkStrength` into a local variable and never references it — BOTH numerator and denominator use `(1 + defStrength)` so defender strength cancels out completely. T-side always gets >=50% (often 61%+) post-plant odds even in 1v5 retakes.",
+                        "devFix": "Use `atkStrength / (atkStrength + defStrength)` weighted by alive player counts and remaining bomb timer instead of cancelling `defStrength`.",
+                    },
+                    {
+                        "id": "inverted-armor-reserve",
+                        "severity": "high",
+                        "title": "3. Inverted Armor Reserve Budget",
+                        "symbol": "MatchPurchaseFunctions::SetPlayerPurchaseBudget",
+                        "liveImpact": f"Round-2+ streak win rate snowballs across {b.get('blowoutsLe3', 0)} 13-<=3 blowouts ({b.get('blowoutLe3Pct', 0)}%).",
+                        "rootCause": "Reserves $650 using `hasArmor ? 650 : 0` — subtracting $650 from players who *already have* armor instead of unarmored eco/force players, starving losing defenders of full rifles and utility.",
+                        "devFix": "Invert condition to `!hasArmor ? 650 : 0` (and reserve $350 for helmet upgrade when kevlar < 100%).",
+                    },
+                    {
+                        "id": "force-buy-loop",
+                        "severity": "high",
+                        "title": "4. Chaotic Force-Buy Loop & Missing $800 Plant Bonus",
+                        "symbol": "BaseMatchTeam::SetPurchaseStrategy & ApplyRoundMoney",
+                        "liveImpact": f"{b.get('top20_13_0', 0)} Top-20 vs Top-20 13-0s; {b.get('upset_13_0', 0)} underdog 13-0s.",
+                        "rootCause": "A team `Save` decision randomly flips to `FullSpend` on `Random.value <= forceBuy * 0.6f`, trapping losing squads on SMG/Deagle half-buys every round, compounded by omitting the CS2 +$800 T bomb-plant team loss bonus.",
+                        "devFix": "Enforce team-wide synchronized eco/full-buy coordination based on projected next-round loss bonus and award +$800 per planted T bomb loss.",
+                    },
+                    {
+                        "id": "skill-pow-28",
+                        "severity": "warn",
+                        "title": "5. Pre-Match `skill^2.8` Snowball Across BO3/BO5",
+                        "symbol": "MiscFunctions::GetOddsOfWinning & Team::GetTotalMapComfort",
+                        "liveImpact": "Even +1.2 skill gaps produce 76-90% actual series win rates vs ~61-70% nominal pre-match odds.",
+                        "rootCause": "Power scales as `pow(GetActivePlayersSkillAverage(), 2.8) * GetComfortMultiplier(comfort)`. Compounded over 24+ rounds per map and BO3 formats, weak 5th-player floors or unpracticed maps snowball into near-unbeatable multi-trophy streaks.",
+                        "devFix": "Soften exponent (`~1.8-2.1`) or add per-map variance / tactical counterplay + meaningful fatigue penalties on packed calendars.",
+                    },
+                ],
+            },
+            {
+                "category": "Awards, MVPs/EVPs & Year-End Top 20 Rankings",
+                "tag": "HLTV / CSTV Scoring",
+                "items": [
+                    {
+                        "id": "mvp-placement",
+                        "severity": "high",
+                        "title": "6. MVP / EVP Selection Ignores Placement & Trophy Context",
+                        "symbol": "TournamentAwardEvaluator / PlayerAwards",
+                        "liveImpact": f"{a.get('flaggedCount', 0)} flagged awards out of {a.get('totalEvaluated', 0)} evaluated ({a.get('outrankedMvps', 0)} outranked MVPs, {a.get('sub110Evps', 0)} sub-1.10 EVPs, {a.get('duplicateMvpEvps', 0)} dupes).",
+                        "rootCause": "MVPs can be awarded to early-eliminated group-stage rating farmers or lower-tier outliers without placement-adjusted weighting (`#1` champion bonus vs finalist/SF carry threshold), while weak winners slip in ahead of higher-impact teammates or duplicate MVP+EVP entries.",
+                        "devFix": "Filter out low-reputation events without awards, weight deep playoff/final maps heavier than groups, and only give MVP to a runner-up/SF star if they massively clear the champion's best player.",
+                    },
+                    {
+                        "id": "top20-cliff",
+                        "severity": "warn",
+                        "title": "7. Year-End Top 20 Linear 50-Match Cliff & Exponential MVP Boost",
+                        "symbol": "YearEndTop20Ranking (`AvgRating_vsTop10 * 1.05^MVP * 1.01^EVP * min(Matches/50, 1)`)",
+                        "liveImpact": "Bubble stars with Elite Ratings vs Top-10 are severely punished if their team played <50 Top-10 maps, while dominant teams stack 1.05^MVP compounding.",
+                        "rootCause": "A strict linear `Matches_vsTop10 / 50` multiplier cuts a 1.25-rated star with 25 Top-10 maps down by 50%, whereas every MVP gives an uncapped exponential `1.05x` multiplier alongside a strict `#1-#13` CSTV ballot tier.",
+                        "devFix": "Replace linear `<50` cutoff with a softer diminishing-returns curve (e.g. `sqrt(min(n, 50) / 50)`), and cap exponential MVP stacking.",
+                    },
+                    {
+                        "id": "burnout-snowball",
+                        "severity": "info",
+                        "title": "8. Negligible Tournament Burnout & Wealth Compounding",
+                        "symbol": "TeamCohesion.cohesionFromBurnout & TeamFinances",
+                        "liveImpact": "Top teams maintain near-100% burnout health across heavy tournament schedules and hoard multi-million balances.",
+                        "rootCause": "Traveling and playing deep in 10+ Tier-1 events per year barely lowers `cohesionFromBurnout`, letting #1 superteams attend every Big Event fresh while prize money locks down top contracts forever.",
+                        "devFix": "Accumulate real travel/series fatigue on consecutive weeks without breaks so skipping minor events becomes strategically necessary.",
+                    },
+                ],
+            },
+            {
+                "category": "AI Transfers, Bench Sabotage & Squad Stability",
+                "tag": "AI GM Logic",
+                "items": [
+                    {
+                        "id": "ai-vulture-bench",
+                        "severity": "critical",
+                        "title": "9. AI Vultures Hunt Benched Players Regardless of Fit",
+                        "symbol": "TeamAI Transfer Evaluation",
+                        "liveImpact": f"{t.get('flaggedTxCount', 0)} questionable AI transfers totaling ${int(t.get('totalWastedSpend', 0) or 0):,}.",
+                        "rootCause": "AI transfer scoring heavily discounts players sitting on another team's bench (`benched == true`) without checking if the target actually beats the buyer's existing starters or fits role needs.",
+                        "devFix": "Require minimum skill upgrade over weakest starter on matching role (`Entry`/`AWP`/`IGL`) and evaluate full active roster strength rather than bench status discounts.",
+                    },
+                    {
+                        "id": "ai-bench-better",
+                        "severity": "critical",
+                        "title": "10. AI Benches Stronger Starters Behind Worse Signings",
+                        "symbol": "Lineup Auto-Select / Contract Priority",
+                        "liveImpact": f"{t.get('benchedOverStarterCount', 0)} teams currently leave a higher-skilled player on the bench behind a weaker starter.",
+                        "rootCause": "Recent signings, wage tiers, or role/nationality flags cause manager AI to demote higher-skilled starters onto the bench (`benched = true`), hurting match win% and triggering endless poaching loops.",
+                        "devFix": "Pick active 5 primarily by role-weighted practical skill total and only bench a better player if deliberately resting/injured/unhappy.",
+                    },
+                    {
+                        "id": "ai-policy-breach",
+                        "severity": "high",
+                        "title": "11. 'Only National' & 'Only National Language' Policy Breaches",
+                        "symbol": "owner.hiringBias == 0 / 1 vs TeamAI Signings",
+                        "liveImpact": f"{t.get('policyHb0Players', 0)} National + {t.get('policyHb1Players', 0)} Language player breaches (+{t.get('policyTxStaff', 0)} staff), ${int(t.get('policySpend', 0) or 0):,} spent.",
+                        "rootCause": "Strict national clubs (`hiringBias == 0`) and language-locked clubs (`hiringBias == 1`) sign foreign or non-fluent players and staff anyway — breaking club identity and slashing `cohesionFromLanguage`.",
+                        "devFix": "Enforce hard pre-bid eligibility filter on `player.nation == team.nation` (`hiringBias == 0`) and fluent shared national language (`>=10` skill for `hiringBias == 1`).",
+                    },
+                    {
+                        "id": "zero-patience-stints",
+                        "severity": "high",
+                        "title": "12. Zero Post-Signing Protection & Revolving-Door Churn",
+                        "symbol": "TeamAI Bench / Transfer Trigger",
+                        "liveImpact": f"Ended/benched stints average {s.get('avgStintMonths', 0)}m ({s.get('sub6MonthsPct', 0)}% below 6.0m CS2 pro low end); {s.get('carouselTeamsCount', 0)} high-churn orgs.",
+                        "rootCause": "After spending heavy buyouts, AI orgs have zero post-signing patience/sunk-cost grace period — immediately benching or selling new players within weeks and turning rosters over 4-8+ times a season.",
+                        "devFix": "Add a minimum ~3-6 month post-transfer protection window (unless terrible form/chemistry breakdown) before AI can bench or transfer-list a paid signing.",
+                    },
+                ],
+            },
+            {
+                "category": "Save Integrity & Match Freeze Prevention",
+                "tag": "Serialization / Tactics",
+                "items": [
+                    {
+                        "id": "tactics-freeze",
+                        "severity": "warn",
+                        "title": "13. Stale `generalTactics` / Missing `mapPositions` Match Freeze",
+                        "symbol": "Team.generalTactics (iglId, sniperId) & Team.mapTactics[].mapPositions",
+                        "liveImpact": "Directly editing or transferring players without rebuilding tactics leaves invalid player IDs in lane slots and freezes simulated matches.",
+                        "rootCause": "The match engine expects all 5 active `mapPositions` across every map and valid `iglId`/`sniperId` references in active `generalTactics` to correspond to unbenched players under contract.",
+                        "devFix": "Ensure game-side fallback validation before match start; inside this editor, Transfers and Validate & Fix automatically call `recalculate_ai_tactics` to prevent corruption.",
+                    },
+                ],
+            },
+        ]
 
     def _showcase_blowouts(self) -> dict[str, Any]:
         assert self.data is not None
@@ -3923,12 +4083,12 @@ class SaveSession:
                 {
                     "title": "2. AI Benches Its Own Better Starter for Worse New Signing",
                     "symbol": "Lineup Auto-Select / Contract Priority",
-                    "summary": "Recent signings or specific role/nationality/salary flags cause the manager AI to drop higher-skilled starters onto the bench (`JamYoung` -> `Zero`, `Techno` -> `REZ`), leaving them stranded until another vulture signs them.",
+                    "summary": "Recent signings or specific role/nationality/salary flags cause the manager AI to drop higher-skilled starters onto the bench, leaving them stranded until another vulture signs them.",
                 },
                 {
                     "title": "3. 'Only National' & 'Only National Language' Ignored by AI",
                     "symbol": "owner.hiringBias == 0 / 1",
-                    "summary": "Both strict national clubs (`hiringBias == 0`, e.g. The MongolZ buying REZ & KRIMZ) and language-locked clubs (`hiringBias == 1`, e.g. Haunted House / Kaleido / FengDa signing players who cannot speak the club's language) ignore their own transfer policy.",
+                    "summary": "Both strict national clubs (`hiringBias == 0`) and language-locked clubs (`hiringBias == 1`) ignore their own transfer policy and sign ineligible or non-fluent players.",
                 },
             ],
         }
@@ -4119,7 +4279,7 @@ class SaveSession:
                 {
                     "title": "1. Zero Post-Signing Protection / Sunk-Cost Memory",
                     "symbol": "TeamAI Bench / Transfer Trigger",
-                    "summary": "After paying $125k-$400k for a player (e.g. device $400k -> 0 matches, VINI $250k -> 28d -> benched), AI immediately forgets the investment and benches or drops them weeks later.",
+                    "summary": "After paying steep buyout fees ($125k-$400k+) for a player, AI immediately forgets the investment and benches or drops them weeks later with almost no matches played.",
                 },
                 {
                     "title": "2. Bench-Poaching Chain Reaction",
@@ -4128,3 +4288,1802 @@ class SaveSession:
                 },
             ],
         }
+
+    # ------------------------------------------------------------------
+    # Team Strength Diff, Trophy Realism Audit, Matchup Lab & Market Radar
+    # ------------------------------------------------------------------
+
+    _PRACTICAL_KEYS = (
+        "tracking", "sprayControl", "reactions", "crosshairPlacement", "flicks", "movement",
+        "overview", "decisions", "composure", "teamwork", "consistency",
+        "pistols", "smgs", "utility", "rifles", "snipers",
+    )
+    _PRACTICAL_IDS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17)
+    _MECH_KEYS = ("tracking", "sprayControl", "reactions", "crosshairPlacement", "flicks", "movement")
+    _MENTAL_KEYS = ("overview", "decisions", "composure", "consistency")
+    _WEAPON_KEYS = ("pistols", "smgs", "rifles", "snipers", "utility")
+
+    @staticmethod
+    def _pearson_r(xs: list[float], ys: list[float]) -> float:
+        n = len(xs)
+        if n < 3 or n != len(ys):
+            return 0.0
+        mx = sum(xs) / n
+        my = sum(ys) / n
+        num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        dx = math.sqrt(sum((x - mx) ** 2 for x in xs))
+        dy = math.sqrt(sum((y - my) ** 2 for y in ys))
+        if dx <= 1e-12 or dy <= 1e-12:
+            return 0.0
+        return round(num / (dx * dy), 3)
+
+    @staticmethod
+    def _ols_fit(xs: list[float], ys: list[float]) -> tuple[float, float, float]:
+        n = len(xs)
+        if n < 3 or n != len(ys):
+            return 0.0, 1.0, 0.0
+        mx = sum(xs) / n
+        my = sum(ys) / n
+        sxx = sum((x - mx) ** 2 for x in xs)
+        if sxx <= 1e-12:
+            return 0.0, round(my, 4), 0.0
+        slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+        intercept = my - slope * mx
+        r = SaveSession._pearson_r(xs, ys)
+        return round(slope, 4), round(intercept, 4), round(r * r, 3)
+
+    @staticmethod
+    def _gini(vals: list[float]) -> float:
+        clean = sorted(max(0.0, float(v)) for v in vals)
+        n = len(clean)
+        tot = sum(clean)
+        if n == 0 or tot <= 1e-12:
+            return 0.0
+        weighted = sum((2 * (i + 1) - n - 1) * v for i, v in enumerate(clean))
+        return round(weighted / (n * tot), 3)
+
+    @staticmethod
+    def _percentiles(vals: list[float]) -> dict[str, Any]:
+        if not vals:
+            return {"count": 0, "min": 0, "p10": 0, "p25": 0, "p50": 0, "p75": 0, "p90": 0, "max": 0}
+        s = sorted(float(v) for v in vals)
+        n = len(s)
+        def _q(p: float) -> float:
+            idx = p * (n - 1)
+            lo = int(math.floor(idx))
+            hi = int(math.ceil(idx))
+            if lo == hi:
+                return round(s[lo], 2)
+            return round(s[lo] + (s[hi] - s[lo]) * (idx - lo), 2)
+        return {
+            "count": n,
+            "min": round(s[0], 2),
+            "p10": _q(0.10),
+            "p25": _q(0.25),
+            "p50": _q(0.50),
+            "p75": _q(0.75),
+            "p90": _q(0.90),
+            "max": round(s[-1], 2),
+        }
+
+    def _player_practical_avg(self, p: dict[str, Any]) -> float:
+        sk = p.get("skills") or {}
+        return sum(float(sk.get(k, 0) or 0) for k in self._PRACTICAL_KEYS) / 16.0
+
+    def _player_avg_pot(self, p: dict[str, Any]) -> float:
+        pot = p.get("potential") or {}
+        if isinstance(pot, dict) and "m_Keys" in pot and "m_Values" in pot:
+            pmap = {int(k): float(v) for k, v in zip(pot["m_Keys"], pot["m_Values"])}
+            vals = [pmap[sid] for sid in self._PRACTICAL_IDS if sid in pmap]
+            if vals:
+                return sum(vals) / len(vals)
+        return self._player_practical_avg(p)
+
+    @staticmethod
+    def _person_fluent_langs(person: dict[str, Any]) -> set[int]:
+        return {
+            int(lg.get("languageId", 0) or 0)
+            for lg in person.get("languagesSpoken", [])
+            if int(lg.get("languageSkill", 0) or 0) >= 10
+        }
+
+    @staticmethod
+    def _fmt_lang_set(lids: set[int]) -> str:
+        if not lids:
+            return "None"
+        return ", ".join(sorted(LANGUAGES.get(lid, f"#{lid}") for lid in lids))
+
+    def _infer_nation_req_langs(self) -> dict[int, set[int]]:
+        """Infer each nation's dominant language(s) from native fluent players."""
+        nat_counts: dict[int, dict[int, int]] = {}
+        for p_obj in self.players_by_id.values():
+            p_n = int(p_obj.get("nation", 0) or 0)
+            if not p_n:
+                continue
+            for lg in p_obj.get("languagesSpoken", []):
+                if int(lg.get("languageSkill", 0) or 0) >= 15:
+                    lid = int(lg.get("languageId", 0) or 0)
+                    if lid:
+                        b = nat_counts.setdefault(p_n, {})
+                        b[lid] = b.get(lid, 0) + 1
+        req: dict[int, set[int]] = {}
+        for p_n, cnts in nat_counts.items():
+            ranked = sorted(cnts.items(), key=lambda z: -z[1])
+            allowed = {ranked[0][0]}
+            if len(ranked) > 1 and ranked[1][1] >= ranked[0][1] * 0.40:
+                allowed.add(ranked[1][0])
+            req[p_n] = allowed
+        return req
+
+    @staticmethod
+    def _team_facility_score(team: dict[str, Any]) -> float:
+        """Exact Team::GetFacilityGradeBackgroundScore average across all 6 facility tracks (0..100)."""
+        std_keys = ("coffeeMachine", "recreation", "branding", "cable", "ventilation")
+        total = 0.0
+        for fk in std_keys:
+            lvl = int(team.get(fk, 0) or 0)
+            total += min(100.0, max(0.0, lvl * 25.0))
+        acad_lvl = int(team.get("academy", 0) or 0)
+        acad_map = {0: 0.0, 1: 25.0, 2: 25.0, 3: 50.0, 4: 50.0, 5: 75.0, 6: 75.0}
+        total += acad_map.get(acad_lvl, 100.0 if acad_lvl >= 7 else 0.0)
+        return round(total / 6.0, 1)
+
+    @staticmethod
+    def _team_cohesion_metrics(team: dict[str, Any]) -> tuple[float, float, float]:
+        """Return (cohesionAvgPct, burnoutHealthPct, languageCohesionPct)."""
+        coh = team.get("teamCohesion") or {}
+        if not isinstance(coh, dict):
+            return 0.0, 0.0, 0.0
+        parts = [
+            float(coh.get("cohesionFromTraining", 0.0) or 0.0),
+            float(coh.get("cohesionFromBurnout", 0.0) or 0.0),
+            float(coh.get("cohesionFromMentality", 0.0) or 0.0),
+            float(coh.get("cohesionFromLanguage", 0.0) or 0.0),
+            float(coh.get("cohesionFromLeadership", 0.0) or 0.0),
+            float(coh.get("cohesionFromRelationships", 0.0) or 0.0),
+        ]
+        avg_pct = round((sum(parts) / len(parts)) * 100.0, 1)
+        burnout_pct = round(parts[1] * 100.0, 1)
+        lang_pct = round(parts[3] * 100.0, 1)
+        return avg_pct, burnout_pct, lang_pct
+
+    @staticmethod
+    def _team_map_comforts(team: dict[str, Any], map_ids: list[int]) -> tuple[float, dict[int, int]]:
+        """Replicate Team::GetTotalMapComfort(mapId) = clamp(genKnowledge + kPlayers + kTraining, 1, 100)."""
+        gts = team.get("generalTactics") or []
+        active_gt = next((g for g in gts if g.get("active")), gts[0] if gts else {})
+        gen_k = float(active_gt.get("knowledge", 0.0) or 0.0)
+        mt_by_id = {}
+        for mt in team.get("mapTactics") or []:
+            mid = int(mt.get("mapId", 0) or 0)
+            if mid and (mid not in mt_by_id or mt.get("active")):
+                mt_by_id[mid] = mt
+        comforts: dict[int, int] = {}
+        for mid in map_ids:
+            mt = mt_by_id.get(mid)
+            if mt:
+                raw = int(gen_k) + int(mt.get("knowledgeFromPlayers", 0) or 0) + int(mt.get("knowledgeFromTraining", 0) or 0)
+                comforts[mid] = max(1, min(100, raw))
+            else:
+                comforts[mid] = max(1, min(100, int(gen_k) or 50))
+        avg_c = round(sum(comforts.values()) / len(comforts), 1) if comforts else 50.0
+        return avg_c, comforts
+
+    def get_strength_realism(self, year: int | None = None, focus_team_id: int | None = None) -> dict[str, Any]:
+        """Compute Team Strength Diff, Multi-Trophy Realism Audit, Odds Calibration, and Data Science stats."""
+        if self.data is None:
+            return {"loaded": False}
+
+        tmpl_names, _, map_names = self._stats_lookups()
+        map_ids = sorted(map_names.keys())
+        cur_dt = self.data.get("datetime", {}) or {}
+        cur_year = int(cur_dt.get("year", 0) or 0)
+        cur_month = int(cur_dt.get("month", 1) or 1)
+        cur_day = int(cur_dt.get("day", 1) or 1)
+
+        # Collect years with played matches or trophies
+        years_set: set[int] = set()
+        for m in self.data.get("matches", {}).get("matches", []):
+            if any(mm.get("baseMatchRounds") for mm in m.get("matchMaps", [])):
+                my = int((m.get("datetime") or {}).get("year", 0) or 0)
+                if my:
+                    years_set.add(my)
+        for t in self.data["teams"]["teams"]:
+            for th in t.get("trophyHistories") or []:
+                ty = int(th.get("year", 0) or 0)
+                if ty:
+                    years_set.add(ty)
+
+        target_year = year if year is not None else (cur_year if cur_year in years_set else (max(years_set) if years_set else cur_year))
+
+        # 1. Per-player season rating from playerCareerStats for target_year
+        p_rating_agg: dict[int, tuple[float, int]] = {}
+        for row in self.data.get("playerCareerStats", {}).get("playerCareerStats", []):
+            if int(row.get("year", 0) or 0) != target_year:
+                continue
+            mw = int(row.get("matchesWon", 0) or 0)
+            ml = int(row.get("matchesLost", 0) or 0)
+            mc = mw + ml
+            if mc <= 0:
+                continue
+            pid = int(row.get("playerId", 0) or 0)
+            prev_acc, prev_m = p_rating_agg.get(pid, (0.0, 0))
+            p_rating_agg[pid] = (prev_acc + float(row.get("accumulativeRating", 0.0) or 0.0), prev_m + mc)
+
+        def _p_year_rating(pid: int) -> float:
+            acc, mc = p_rating_agg.get(pid, (0.0, 0))
+            return round(acc / mc, 3) if mc > 0 else 0.0
+
+        # 2. Match records, streaks, pre-match odds vs actual calibration in target_year
+        team_match_rec: dict[int, dict[str, Any]] = {}
+        buckets = [
+            {"label": "50-55%", "lo": 0.50, "hi": 0.55, "wins": 0, "total": 0, "oddsSum": 0.0},
+            {"label": "55-60%", "lo": 0.55, "hi": 0.60, "wins": 0, "total": 0, "oddsSum": 0.0},
+            {"label": "60-65%", "lo": 0.60, "hi": 0.65, "wins": 0, "total": 0, "oddsSum": 0.0},
+            {"label": "65-70%", "lo": 0.65, "hi": 0.70, "wins": 0, "total": 0, "oddsSum": 0.0},
+            {"label": "70-80%", "lo": 0.70, "hi": 0.80, "wins": 0, "total": 0, "oddsSum": 0.0},
+            {"label": "80-100%", "lo": 0.80, "hi": 1.01, "wins": 0, "total": 0, "oddsSum": 0.0},
+        ]
+        format_cal = {
+            "BO1": {"wins": 0, "total": 0, "oddsSum": 0.0},
+            "BO3": {"wins": 0, "total": 0, "oddsSum": 0.0},
+            "BO5": {"wins": 0, "total": 0, "oddsSum": 0.0},
+        }
+        completed_matches: list[tuple[tuple[int, int, int, int], int, int, int, float, float, int, int]] = []
+        for m in self.data.get("matches", {}).get("matches", []):
+            match_maps = [mm for mm in m.get("matchMaps", []) if mm.get("baseMatchRounds")]
+            if not match_maps:
+                continue
+            dt_obj = m.get("datetime") or {}
+            if int(dt_obj.get("year", 0) or 0) != target_year:
+                continue
+            t1 = int(m.get("team1Id", 0) or 0)
+            t2 = int(m.get("team2Id", 0) or 0)
+            if not t1 or not t2:
+                continue
+            t1_maps = t2_maps = 0
+            for mm in match_maps:
+                rds = mm.get("baseMatchRounds", [])
+                r1 = sum(1 for r in rds if r.get("winner") == t1)
+                r2 = sum(1 for r in rds if r.get("winner") == t2)
+                if r1 > r2:
+                    t1_maps += 1
+                else:
+                    t2_maps += 1
+            win_id = t1 if t1_maps > t2_maps else t2
+            o1 = float(m.get("team1PreMatchOdds", 0.5) or 0.5)
+            o2 = float(m.get("team2PreMatchOdds", 0.5) or 0.5)
+            bo = int(m.get("numberOfMaps", len(match_maps)) or len(match_maps))
+            completed_matches.append((self._match_date_key(dt_obj), t1, t2, win_id, o1, o2, t1_maps, t2_maps))
+
+            if abs(o1 - o2) > 1e-6:
+                fav_id = t1 if o1 > o2 else t2
+                fav_o = max(o1, o2)
+                fav_won = 1 if win_id == fav_id else 0
+                for b in buckets:
+                    if b["lo"] <= fav_o < b["hi"]:
+                        b["wins"] += fav_won
+                        b["total"] += 1
+                        b["oddsSum"] += fav_o
+                        break
+                fmt = "BO5" if bo >= 5 else ("BO3" if bo == 3 else "BO1")
+                format_cal[fmt]["wins"] += fav_won
+                format_cal[fmt]["total"] += 1
+                format_cal[fmt]["oddsSum"] += fav_o
+
+        completed_matches.sort(key=lambda x: x[0])
+        for _, t1, t2, win_id, o1, o2, m1, m2 in completed_matches:
+            for tid_x, won_x, mw_x, ml_x, o_x in (
+                (t1, win_id == t1, m1, m2, o1),
+                (t2, win_id == t2, m2, m1, o2),
+            ):
+                rec = team_match_rec.setdefault(
+                    tid_x,
+                    {"wins": 0, "losses": 0, "mapsWon": 0, "mapsLost": 0, "oddsSum": 0.0, "curStreak": 0, "maxStreak": 0},
+                )
+                rec["mapsWon"] += mw_x
+                rec["mapsLost"] += ml_x
+                rec["oddsSum"] += o_x
+                if won_x:
+                    rec["wins"] += 1
+                    rec["curStreak"] += 1
+                    if rec["curStreak"] > rec["maxStreak"]:
+                        rec["maxStreak"] = rec["curStreak"]
+                else:
+                    rec["losses"] += 1
+                    rec["curStreak"] = 0
+
+        # 3. Completed tournaments & trophies in target_year
+        tourn_by_id_raw = {t["id"]: t for t in self.data.get("tournaments", {}).get("tournaments", [])}
+
+        # Build full trophy haul per team (from trophyHistories, falling back to rankingPoints if needed)
+        trophies_by_team: dict[int, list[dict[str, Any]]] = {}
+        for t in self.data["teams"]["teams"]:
+            tid = t["id"]
+            t_list: list[dict[str, Any]] = []
+            for th in t.get("trophyHistories") or []:
+                if int(th.get("year", 0) or 0) != target_year:
+                    continue
+                th_tid = int(th.get("tournamentId", 0) or 0)
+                t_obj = tourn_by_id_raw.get(th_tid, {})
+                tmpl = int(th.get("tournamentTemplate", t_obj.get("template", -1)))
+                rep = int(t_obj.get("reputation", 1) or 1)
+                win_names = [self.players_by_id[pid]["name"] for pid in (th.get("winningPlayerIds") or []) if pid in self.players_by_id]
+                t_list.append(
+                    {
+                        "tournamentId": th_tid,
+                        "tournamentName": t_obj.get("name") or tmpl_names.get(tmpl, f"Event #{tmpl}"),
+                        "reputation": rep,
+                        "isTier1": rep >= 16,
+                        "seasonPart": "Spring" if th.get("spring") else "Fall",
+                        "winningRoster": win_names,
+                    }
+                )
+            if not t_list:
+                # Fallback to rankingPoints place==1 for saves where trophyHistories weren't stored
+                for rp in t.get("rankingPoints") or []:
+                    dg = rp.get("dateGranted") or {}
+                    if int(dg.get("year", 0) or 0) == target_year and int(rp.get("tournamentPlacement", 0) or 0) == 1:
+                        tmpl = int(rp.get("tournamentTemplate", -1))
+                        t_list.append(
+                            {
+                                "tournamentId": 0,
+                                "tournamentName": tmpl_names.get(tmpl, f"Event #{tmpl}"),
+                                "reputation": 16 if int(rp.get("originalPoints", 0) or 0) >= 400 else 10,
+                                "isTier1": int(rp.get("originalPoints", 0) or 0) >= 400,
+                                "seasonPart": "Spring" if int(dg.get("month", 7) or 7) <= 6 else "Fall",
+                                "winningRoster": [],
+                            }
+                        )
+            if t_list:
+                trophies_by_team[tid] = t_list
+
+        total_tier1_completed = sum(
+            1 for tlist in trophies_by_team.values() for tr in tlist if tr["isTier1"]
+        )
+
+        # 4. Compute Team Strength metrics for every team with active starters
+        user_team_id = int((self.data.get("profile") or {}).get("team", 0) or 0)
+        team_strengths: list[dict[str, Any]] = []
+        for t in self.data["teams"]["teams"]:
+            tid = t["id"]
+            contracts = self.get_team_player_contracts(tid)
+            starters = [self.players_by_id[c["playerId"]] for c in contracts if not c.get("benched") and c["playerId"] in self.players_by_id]
+            benched = [self.players_by_id[c["playerId"]] for c in contracts if c.get("benched") and c["playerId"] in self.players_by_id]
+            if not starters:
+                continue
+
+            starter_profiles = []
+            prac_totals = []
+            mech_vals = []
+            mental_vals = []
+            wpn_vals = []
+            awp_scores = []
+            igl_scores = []
+            for p in starters:
+                sk = p.get("skills") or {}
+                ptot = sum(float(sk.get(k, 0) or 0) for k in self._PRACTICAL_KEYS)
+                pavg = ptot / 16.0
+                mech = sum(float(sk.get(k, 0) or 0) for k in self._MECH_KEYS) / len(self._MECH_KEYS)
+                ment = sum(float(sk.get(k, 0) or 0) for k in self._MENTAL_KEYS) / len(self._MENTAL_KEYS)
+                wpn = sum(float(sk.get(k, 0) or 0) for k in self._WEAPON_KEYS) / len(self._WEAPON_KEYS)
+                awp_s = float(sk.get("snipers", 0) or 0) * 0.70 + float(sk.get("reactions", 0) or 0) * 0.15 + float(sk.get("composure", 0) or 0) * 0.15
+                igl_s = float(sk.get("overview", 0) or 0) * 0.35 + float(sk.get("decisions", 0) or 0) * 0.35 + float(sk.get("leadership", 0) or 0) * 0.30
+                prac_totals.append(ptot)
+                mech_vals.append(mech)
+                mental_vals.append(ment)
+                wpn_vals.append(wpn)
+                awp_scores.append(awp_s)
+                igl_scores.append(igl_s)
+                starter_profiles.append(
+                    {
+                        "playerId": p["id"],
+                        "name": p.get("name", ""),
+                        "age": p.get("age", 0),
+                        "avgSkill": round(pavg, 2),
+                        "practicalTotal": round(ptot, 1),
+                        "mechanics": round(mech, 2),
+                        "mental": round(ment, 2),
+                        "weapons": round(wpn, 2),
+                        "awpScore": round(awp_s, 2),
+                        "iglScore": round(igl_s, 2),
+                        "yearRating": _p_year_rating(p["id"]),
+                    }
+                )
+            starter_profiles.sort(key=lambda r: -r["avgSkill"])
+
+            team_prac_total = sum(prac_totals) / len(prac_totals)
+            avg_skill = team_prac_total / 16.0
+            power_index = max(1.0, team_prac_total) ** 2.8
+            best_star = starter_profiles[0]
+            weakest_link = starter_profiles[-1]
+
+            best_bench_p = max(
+                benched,
+                key=lambda bp: sum(float((bp.get("skills") or {}).get(k, 0) or 0) for k in self._PRACTICAL_KEYS) / 16.0,
+                default=None,
+            )
+            best_bench_skill = (
+                round(sum(float((best_bench_p.get("skills") or {}).get(k, 0) or 0) for k in self._PRACTICAL_KEYS) / 16.0, 2)
+                if best_bench_p else 0.0
+            )
+            bench_waste = round(max(0.0, best_bench_skill - weakest_link["avgSkill"]), 2)
+
+            staff_cs = self.get_team_staff_contracts(tid)
+            staff_objs = [self.staff_by_id[sc["staffId"]] for sc in staff_cs if sc["staffId"] in self.staff_by_id]
+            staff_avg = round(sum(_staff_avg_skill(so) for so in staff_objs) / len(staff_objs), 2) if staff_objs else 0.0
+
+            coh_avg, burnout_pct, lang_pct = self._team_cohesion_metrics(t)
+            map_avg, map_comforts = self._team_map_comforts(t, map_ids)
+            fac_score = self._team_facility_score(t)
+            wages = sum(int(c.get("salaryYear", 0) or 0) for c in contracts) + sum(int(sc.get("salaryYear", 0) or 0) for sc in staff_cs)
+
+            rhist = t.get("rankingHistory") or []
+            world_rank = int(rhist[-1]) if rhist else 0
+            rec = team_match_rec.get(tid, {})
+            mw = rec.get("wins", 0)
+            ml = rec.get("losses", 0)
+            mtot = mw + ml
+            win_pct = round(mw * 100.0 / mtot, 1) if mtot else 0.0
+            avg_odds = round((rec.get("oddsSum", 0.0) / mtot) * 100.0, 1) if mtot else 0.0
+            map_w = rec.get("mapsWon", 0)
+            map_l = rec.get("mapsLost", 0)
+            map_tot = map_w + map_l
+
+            trophies = trophies_by_team.get(tid, [])
+            tier1_trophies = sum(1 for tr in trophies if tr["isTier1"])
+
+            team_strengths.append(
+                {
+                    "teamId": tid,
+                    "name": t.get("name", ""),
+                    "nationName": NATIONS.get(t.get("nation", 0), ""),
+                    "worldRank": world_rank,
+                    "reputation": int(t.get("reputation", 1) or 1),
+                    "isUserTeam": tid == user_team_id,
+                    "starterCount": len(starters),
+                    "avgSkill": round(avg_skill, 2),
+                    "practicalSkillTotal": round(team_prac_total, 1),
+                    "powerIndex": power_index,
+                    "mechanicsAvg": round(sum(mech_vals) / len(mech_vals), 2),
+                    "mentalAvg": round(sum(mental_vals) / len(mental_vals), 2),
+                    "weaponsAvg": round(sum(wpn_vals) / len(wpn_vals), 2),
+                    "bestAwp": round(max(awp_scores), 2),
+                    "bestIgl": round(max(igl_scores), 2),
+                    "bestStarSkill": best_star["avgSkill"],
+                    "bestStarName": best_star["name"],
+                    "weakestLinkSkill": weakest_link["avgSkill"],
+                    "weakestLinkName": weakest_link["name"],
+                    "spread": round(best_star["avgSkill"] - weakest_link["avgSkill"], 2),
+                    "benchedCount": len(benched),
+                    "bestBenchedSkill": best_bench_skill,
+                    "bestBenchedName": best_bench_p.get("name", "") if best_bench_p else "",
+                    "benchWasteGap": bench_waste,
+                    "staffCount": len(staff_objs),
+                    "staffAvgSkill": staff_avg,
+                    "cohesionAvg": coh_avg,
+                    "burnoutHealth": burnout_pct,
+                    "languageCohesion": lang_pct,
+                    "mapReadinessAvg": map_avg,
+                    "mapComforts": map_comforts,
+                    "facilityScore": fac_score,
+                    "balance": int((t.get("teamFinances") or {}).get("currentBalance", 0) or 0),
+                    "annualWages": wages,
+                    "matches": mtot,
+                    "wins": mw,
+                    "losses": ml,
+                    "winPct": win_pct,
+                    "mapsWon": map_w,
+                    "mapsLost": map_l,
+                    "mapWinPct": round(map_w * 100.0 / map_tot, 1) if map_tot else 0.0,
+                    "avgPreMatchOdds": avg_odds,
+                    "oddsDefiancePp": round(win_pct - avg_odds, 1) if mtot else 0.0,
+                    "maxWinStreak": rec.get("maxStreak", 0),
+                    "trophiesCount": len(trophies),
+                    "tier1TrophiesCount": tier1_trophies,
+                    "trophySharePct": round(tier1_trophies * 100.0 / total_tier1_completed, 1) if total_tier1_completed else 0.0,
+                    "trophies": trophies,
+                    "starters": starter_profiles,
+                }
+            )
+
+        team_strengths.sort(key=lambda r: (r["worldRank"] == 0, r["worldRank"] if r["worldRank"] > 0 else 9999, -r["avgSkill"]))
+
+        ranked_teams = [r for r in team_strengths if r["worldRank"] > 0]
+        rank1 = ranked_teams[0] if ranked_teams else (max(team_strengths, key=lambda r: r["avgSkill"]) if team_strengths else None)
+        top10 = ranked_teams[:10] if ranked_teams else team_strengths[:10]
+        top10_avg_skill = sum(r["avgSkill"] for r in top10) / len(top10) if top10 else 0.0
+
+        for r in team_strengths:
+            r["gapVsRank1"] = round(r["avgSkill"] - rank1["avgSkill"], 2) if rank1 else 0.0
+            r["gapVsTop10Avg"] = round(r["avgSkill"] - top10_avg_skill, 2)
+            r["gameOddsVsRank1"] = round(r["powerIndex"] * 100.0 / (r["powerIndex"] + rank1["powerIndex"]), 1) if rank1 else 50.0
+
+        # 5. Odds Calibration output
+        cal_rows = []
+        for b in buckets:
+            tot = b["total"]
+            exp_pct = round((b["oddsSum"] / tot) * 100.0, 1) if tot else 0.0
+            act_pct = round((b["wins"] / tot) * 100.0, 1) if tot else 0.0
+            cal_rows.append(
+                {
+                    "bucket": b["label"],
+                    "matches": tot,
+                    "wins": b["wins"],
+                    "expectedPct": exp_pct,
+                    "actualPct": act_pct,
+                    "diffPp": round(act_pct - exp_pct, 1) if tot else 0.0,
+                }
+            )
+        fmt_rows = []
+        for fmt_name in ("BO1", "BO3", "BO5"):
+            fd = format_cal[fmt_name]
+            tot = fd["total"]
+            exp_pct = round((fd["oddsSum"] / tot) * 100.0, 1) if tot else 0.0
+            act_pct = round((fd["wins"] / tot) * 100.0, 1) if tot else 0.0
+            fmt_rows.append({"format": fmt_name, "matches": tot, "expectedPct": exp_pct, "actualPct": act_pct, "diffPp": round(act_pct - exp_pct, 1) if tot else 0.0})
+
+        # 6. Trophy Realism Audit for focus team (specified focus_team_id, or top trophy winner, or rank #1)
+        by_tid = {r["teamId"]: r for r in team_strengths}
+        top_trophy_team = max(team_strengths, key=lambda r: (r["trophiesCount"], r["winPct"], r["avgSkill"]), default=None)
+        focus_team = by_tid.get(focus_team_id or 0) or top_trophy_team or rank1
+
+        realism_audit: dict[str, Any] = {}
+        if focus_team:
+            rivals = [r for r in ranked_teams[:10] if r["teamId"] != focus_team["teamId"]]
+            rival_avg_skill = round(sum(r["avgSkill"] for r in rivals) / len(rivals), 2) if rivals else 0.0
+            rival_coh_avg = round(sum(r["cohesionAvg"] for r in rivals) / len(rivals), 1) if rivals else 0.0
+            rival_map_avg = round(sum(r["mapReadinessAvg"] for r in rivals) / len(rivals), 1) if rivals else 0.0
+            rival_staff_avg = round(sum(r["staffAvgSkill"] for r in rivals) / len(rivals), 2) if rivals else 0.0
+            rival_bal_med = sorted(r["balance"] for r in rivals)[len(rivals) // 2] if rivals else 0
+            rivals_benching_better = sum(1 for r in rivals if r["benchWasteGap"] > 0.2)
+            rivals_below_floor = sum(1 for r in rivals if r["weakestLinkSkill"] < focus_team["weakestLinkSkill"])
+
+            tr_cnt = focus_team["trophiesCount"]
+            win_pct = focus_team["winPct"]
+            share_pct = focus_team["trophySharePct"]
+            if tr_cnt >= 10 or win_pct >= 88.0 or share_pct >= 55.0:
+                verdict = "UNREALISTIC — Engine Snowball Artifact"
+                verdict_level = "bad"
+            elif tr_cnt >= 7 or win_pct >= 82.0:
+                verdict = "BORDERLINE — Historic Superteam Era"
+                verdict_level = "warn"
+            else:
+                verdict = "REALISTIC — Pro Tier-1 Parity"
+                verdict_level = "ok"
+
+            realism_audit = {
+                "focusTeamId": focus_team["teamId"],
+                "focusTeamName": focus_team["name"],
+                "verdict": verdict,
+                "verdictLevel": verdict_level,
+                "trophiesWon": tr_cnt,
+                "tier1TrophiesWon": focus_team["tier1TrophiesCount"],
+                "totalTier1Completed": total_tier1_completed,
+                "trophySharePct": share_pct,
+                "wins": focus_team["wins"],
+                "losses": focus_team["losses"],
+                "winPct": win_pct,
+                "avgPreMatchOdds": focus_team["avgPreMatchOdds"],
+                "oddsDefiancePp": focus_team["oddsDefiancePp"],
+                "maxWinStreak": focus_team["maxWinStreak"],
+                "avgSkill": focus_team["avgSkill"],
+                "rivalTop10AvgSkill": rival_avg_skill,
+                "skillEdgeVsTop10": round(focus_team["avgSkill"] - rival_avg_skill, 2),
+                "proBenchmarks": {
+                    "proPeakTitlesYr": "4 - 7 Big Events",
+                    "proPeakMatchWinPct": "72% - 82%",
+                    "proPeakSweepShare": "25% - 40%",
+                    "proBestExamples": "2018 Astralis / 2024 Spirit / 2025 Vitality",
+                },
+                "factors": [
+                    {
+                        "title": "1. Round -> Map -> BO3 Probability Compounding",
+                        "summary": f"{focus_team['name']} averages {focus_team['avgPreMatchOdds']}% pre-match odds (MiscFunctions::GetOddsOfWinning skill^2.8), yet wins {win_pct}% of matches (+{focus_team['oddsDefiancePp']}pp defiance). Across the whole save, 60-65% favorites actually win {cal_rows[2]['actualPct']}% and 70-80% favorites win {cal_rows[4]['actualPct']}%.",
+                    },
+                    {
+                        "title": "2. Weakest-Link Floor & Superteam Stacking",
+                        "summary": f"{focus_team['name']}'s weakest starter ({focus_team['weakestLinkName']} {focus_team['weakestLinkSkill']}) beats the weakest starter on {rivals_below_floor}/{len(rivals)} Top-10 rivals, and even beats several Top-10 team averages ({rival_avg_skill}).",
+                    },
+                    {
+                        "title": "3. AI Bench Sabotage & Transfer Mistakes",
+                        "summary": f"{rivals_benching_better}/{len(rivals)} Top-10 AI rivals are leaving a stronger player on the bench or churning rosters mid-season, gifting free series consistency to a stable 5-man core.",
+                    },
+                    {
+                        "title": "4. Off-Server Edge (Cohesion, Map Prep & Staff)",
+                        "summary": f"{focus_team['name']} holds {focus_team['cohesionAvg']}% cohesion (rivals avg {rival_coh_avg}%), {focus_team['mapReadinessAvg']} map comfort (rivals {rival_map_avg}), and {focus_team['staffAvgSkill']} staff avg (rivals {rival_staff_avg}).",
+                    },
+                    {
+                        "title": "5. Near-Zero Tournament Burnout & Wealth Snowball",
+                        "summary": f"Even after {focus_team['matches']} matches and {tr_cnt} trophy runs, {focus_team['name']} sits at {focus_team['burnoutHealth']}% burnout health with ${focus_team['balance']:,} cash (Top-10 rival median ${rival_bal_med:,}) to retain 18+ skill superstars.",
+                    },
+                ],
+                "leagueTrophyTable": sorted(
+                    [
+                        {
+                            "teamId": r["teamId"],
+                            "name": r["name"],
+                            "worldRank": r["worldRank"],
+                            "avgSkill": r["avgSkill"],
+                            "trophiesCount": r["trophiesCount"],
+                            "tier1TrophiesCount": r["tier1TrophiesCount"],
+                            "trophySharePct": r["trophySharePct"],
+                            "winPct": r["winPct"],
+                            "maxWinStreak": r["maxWinStreak"],
+                        }
+                        for r in team_strengths if r["trophiesCount"] > 0 or (r["worldRank"] and r["worldRank"] <= 10)
+                    ],
+                    key=lambda x: (-x["trophiesCount"], -x["winPct"], x["worldRank"] or 9999),
+                )[:20],
+            }
+
+        # 7. Data Science Lab: Skill -> Rating Regression, Age Curve, Parity/Gini & Nation Meta
+        rated_pool: list[dict[str, Any]] = []
+        rank_by_tid = {r["teamId"]: (r["worldRank"] if r["worldRank"] > 0 else 200) for r in team_strengths}
+        for pid, (acc, mc) in p_rating_agg.items():
+            p = self.players_by_id.get(pid)
+            if not p or mc < 6:
+                continue
+            avg_sk = self._player_practical_avg(p)
+            c = self.player_contract_by_pid.get(pid)
+            tid = int(c["teamId"]) if c else 0
+            rated_pool.append(
+                {
+                    "playerId": pid,
+                    "name": p.get("name", ""),
+                    "age": int(p.get("age", 0) or 0),
+                    "teamId": tid,
+                    "teamName": self.teams_by_id[tid]["name"] if tid in self.teams_by_id else "Free Agent",
+                    "teamRank": rank_by_tid.get(tid, 200),
+                    "avgSkill": round(avg_sk, 2),
+                    "matches": mc,
+                    "actualRating": round(acc / mc, 3),
+                    "skills": p.get("skills") or {},
+                }
+            )
+        if len(rated_pool) < 15:
+            # Early-season fallback to >=1 match if save just rolled over year
+            rated_pool = []
+            for pid, (acc, mc) in p_rating_agg.items():
+                p = self.players_by_id.get(pid)
+                if not p or mc < 1:
+                    continue
+                avg_sk = self._player_practical_avg(p)
+                c = self.player_contract_by_pid.get(pid)
+                tid = int(c["teamId"]) if c else 0
+                rated_pool.append(
+                    {
+                        "playerId": pid,
+                        "name": p.get("name", ""),
+                        "age": int(p.get("age", 0) or 0),
+                        "teamId": tid,
+                        "teamName": self.teams_by_id[tid]["name"] if tid in self.teams_by_id else "Free Agent",
+                        "teamRank": rank_by_tid.get(tid, 200),
+                        "avgSkill": round(avg_sk, 2),
+                        "matches": mc,
+                        "actualRating": round(acc / mc, 3),
+                        "skills": p.get("skills") or {},
+                    }
+                )
+
+        ys_rat = [r["actualRating"] for r in rated_pool]
+        skill_correlations: list[dict[str, Any]] = []
+        if len(rated_pool) >= 5:
+            skill_correlations.append(
+                {
+                    "key": "avgSkill",
+                    "label": "Practical Avg Skill (16)",
+                    "group": "Composite",
+                    "r": self._pearson_r([r["avgSkill"] for r in rated_pool], ys_rat),
+                }
+            )
+            for sk_meta in PLAYER_SKILLS:
+                skey = sk_meta["key"]
+                xs = [float(r["skills"].get(skey, 0) or 0) for r in rated_pool]
+                skill_correlations.append(
+                    {
+                        "key": skey,
+                        "label": sk_meta["label"],
+                        "group": sk_meta["group"],
+                        "r": self._pearson_r(xs, ys_rat),
+                    }
+                )
+            skill_correlations.append(
+                {
+                    "key": "age",
+                    "label": "Player Age",
+                    "group": "Meta",
+                    "r": self._pearson_r([float(r["age"]) for r in rated_pool], ys_rat),
+                }
+            )
+            skill_correlations.append(
+                {
+                    "key": "teamRank",
+                    "label": "Team World Rank #",
+                    "group": "Meta",
+                    "r": self._pearson_r([float(r["teamRank"]) for r in rated_pool], ys_rat),
+                }
+            )
+            skill_correlations.sort(key=lambda c: -abs(c["r"]))
+
+        ols_slope, ols_intercept, ols_r2 = self._ols_fit([r["avgSkill"] for r in rated_pool], ys_rat)
+        residuals_list = []
+        for r in rated_pool:
+            exp_rat = round(ols_slope * r["avgSkill"] + ols_intercept, 3)
+            resid = round(r["actualRating"] - exp_rat, 3)
+            residuals_list.append(
+                {
+                    "playerId": r["playerId"],
+                    "name": r["name"],
+                    "age": r["age"],
+                    "teamId": r["teamId"],
+                    "teamName": r["teamName"],
+                    "avgSkill": r["avgSkill"],
+                    "matches": r["matches"],
+                    "actualRating": r["actualRating"],
+                    "expectedRating": exp_rat,
+                    "residual": resid,
+                }
+            )
+        overperformers = sorted(residuals_list, key=lambda x: (-x["residual"], -x["actualRating"]))[:15]
+        underperformers = sorted(residuals_list, key=lambda x: (x["residual"], x["actualRating"]))[:15]
+
+        # Empirical Age Curve across all players + ratings from p_rating_agg
+        age_brackets = [
+            ("<=18", 0, 18),
+            ("19-20", 19, 20),
+            ("21-22", 21, 22),
+            ("23-24", 23, 24),
+            ("25-26", 25, 26),
+            ("27-28", 27, 28),
+            ("29+", 29, 99),
+        ]
+        age_curve: list[dict[str, Any]] = []
+        for b_lbl, alo, ahi in age_brackets:
+            grp_ps = [p for p in self.players_by_id.values() if alo <= int(p.get("age", 0) or 0) <= ahi]
+            if not grp_ps:
+                continue
+            sk_vals = [self._player_practical_avg(p) for p in grp_ps]
+            pot_vals = [self._player_avg_pot(p) for p in grp_ps]
+            r_vals = [_p_year_rating(p["id"]) for p in grp_ps if p_rating_agg.get(p["id"], (0.0, 0))[1] >= 6]
+            mean_sk = round(sum(sk_vals) / len(sk_vals), 2)
+            mean_pot = round(sum(pot_vals) / len(pot_vals), 2)
+            age_curve.append(
+                {
+                    "bracket": b_lbl,
+                    "count": len(grp_ps),
+                    "avgSkill": mean_sk,
+                    "avgPot": mean_pot,
+                    "headroom": round(mean_pot - mean_sk, 2),
+                    "ratedCount": len(r_vals),
+                    "avgRating": round(sum(r_vals) / len(r_vals), 3) if r_vals else 0.0,
+                }
+            )
+
+        # Parity, Gini & Distributions + Team Factor Correlations + Nation Talent Meta
+        team_skills_all = [r["avgSkill"] for r in team_strengths]
+        player_skills_all = [self._player_practical_avg(p) for p in self.players_by_id.values()]
+        team_wages_all = [float(r["annualWages"]) for r in team_strengths if r["annualWages"] > 0]
+        team_bal_all = [max(0.0, float(r["balance"])) for r in team_strengths]
+        distributions = {
+            "teamSkill": {"gini": self._gini(team_skills_all), **self._percentiles(team_skills_all)},
+            "playerSkill": {"gini": self._gini(player_skills_all), **self._percentiles(player_skills_all)},
+            "teamWages": {"gini": self._gini(team_wages_all), **self._percentiles(team_wages_all)},
+            "teamBalance": {"gini": self._gini(team_bal_all), **self._percentiles(team_bal_all)},
+        }
+
+        active_teams = [r for r in team_strengths if r["matches"] >= 8]
+        ys_win = [float(r["winPct"]) for r in active_teams]
+        team_factor_corrs = []
+        for fkey, flbl in (
+            ("avgSkill", "Roster Avg Skill"),
+            ("weakestLinkSkill", "Weakest-Link Floor"),
+            ("bestStarSkill", "Best Star Peak"),
+            ("mapReadinessAvg", "Map Comfort Avg"),
+            ("cohesionAvg", "Team Cohesion %"),
+            ("staffAvgSkill", "Coaching Staff Avg"),
+            ("facilityScore", "Facility Score"),
+            ("annualWages", "Annual Payroll ($)"),
+        ):
+            team_factor_corrs.append(
+                {
+                    "key": fkey,
+                    "label": flbl,
+                    "r": self._pearson_r([float(r[fkey]) for r in active_teams], ys_win),
+                }
+            )
+        team_factor_corrs.sort(key=lambda x: -abs(x["r"]))
+
+        nation_acc: dict[int, dict[str, Any]] = {}
+        for p in self.players_by_id.values():
+            nid = int(p.get("nation", 0) or 0)
+            if not nid:
+                continue
+            sk = self._player_practical_avg(p)
+            pot = self._player_avg_pot(p)
+            entry = nation_acc.setdefault(nid, {"skills": [], "pots": [], "ratings": [], "elite": 0})
+            entry["skills"].append(sk)
+            entry["pots"].append(pot)
+            if sk >= 16.0:
+                entry["elite"] += 1
+            if p_rating_agg.get(p["id"], (0.0, 0))[1] >= 6:
+                entry["ratings"].append(_p_year_rating(p["id"]))
+        nation_meta = []
+        for nid, info in nation_acc.items():
+            cnt = len(info["skills"])
+            if cnt < 10:
+                continue
+            nation_meta.append(
+                {
+                    "nationId": nid,
+                    "nationName": NATIONS.get(nid, f"Nation #{nid}"),
+                    "playerCount": cnt,
+                    "elite16Plus": info["elite"],
+                    "avgSkill": round(sum(info["skills"]) / cnt, 2),
+                    "avgPot": round(sum(info["pots"]) / cnt, 2),
+                    "avgRating": round(sum(info["ratings"]) / len(info["ratings"]), 3) if info["ratings"] else 0.0,
+                }
+            )
+        nation_meta.sort(key=lambda x: (-x["elite16Plus"], -x["avgSkill"], -x["playerCount"]))
+
+        cur_days_approx = cur_year * 365 + (cur_month - 1) * 30 + cur_day
+        market_radar = self._build_market_radar(p_rating_agg, cur_days_approx)
+
+        return {
+            "loaded": True,
+            "year": target_year,
+            "years": sorted(years_set, reverse=True),
+            "mapsMeta": [{"mapId": mid, "name": map_names[mid]} for mid in map_ids],
+            "rank1Skill": rank1["avgSkill"] if rank1 else 0.0,
+            "top10AvgSkill": round(top10_avg_skill, 2),
+            "teamStrengths": team_strengths,
+            "oddsCalibration": cal_rows,
+            "formatCalibration": fmt_rows,
+            "trophyRealism": realism_audit,
+            "regression": {
+                "sampleSize": len(rated_pool),
+                "olsModel": {"slope": ols_slope, "intercept": ols_intercept, "r2": ols_r2},
+                "skillCorrelations": skill_correlations,
+                "overperformers": overperformers,
+                "underperformers": underperformers,
+                "ageCurve": age_curve,
+            },
+            "parity": {
+                "teamSampleSize": len(active_teams),
+                "distributions": distributions,
+                "teamFactorCorrelations": team_factor_corrs,
+                "nationMeta": nation_meta[:20],
+            },
+            "marketRadar": market_radar,
+        }
+
+    # ------------------------------------------------------------------
+    # Manager Helper Lab: Market Radar, Roster Optimizer, Replacement Finder, Wonderkids
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _classify_player_role(sk: dict[str, Any]) -> tuple[str, float, float, float]:
+        """Return (bestRoleLabel, awpScore, iglScore, entryScore)."""
+        awp_s = float(sk.get("snipers", 0) or 0) * 0.68 + float(sk.get("reactions", 0) or 0) * 0.16 + float(sk.get("composure", 0) or 0) * 0.16
+        igl_s = float(sk.get("overview", 0) or 0) * 0.35 + float(sk.get("decisions", 0) or 0) * 0.35 + float(sk.get("leadership", 0) or 0) * 0.30
+        entry_s = float(sk.get("aggression", 0) or 0) * 0.35 + float(sk.get("reactions", 0) or 0) * 0.25 + float(sk.get("flicks", 0) or 0) * 0.20 + float(sk.get("movement", 0) or 0) * 0.20
+        sup_s = float(sk.get("utility", 0) or 0) * 0.40 + float(sk.get("teamwork", 0) or 0) * 0.35 + float(sk.get("consistency", 0) or 0) * 0.25
+        rif_s = float(sk.get("rifles", 0) or 0) * 0.45 + float(sk.get("sprayControl", 0) or 0) * 0.30 + float(sk.get("crosshairPlacement", 0) or 0) * 0.25
+        if float(sk.get("snipers", 0) or 0) >= 15.0 and awp_s >= rif_s:
+            role = "AWPer"
+        elif igl_s >= 14.5 and float(sk.get("leadership", 0) or 0) >= 13.0 and igl_s >= max(entry_s, rif_s) - 1.5:
+            role = "IGL"
+        elif entry_s >= max(rif_s, sup_s) and float(sk.get("aggression", 0) or 0) >= 14.0:
+            role = "Entry"
+        elif sup_s >= rif_s:
+            role = "Support"
+        else:
+            role = "Rifler"
+        return role, round(awp_s, 2), round(igl_s, 2), round(entry_s, 2)
+
+    def _build_market_radar(
+        self,
+        p_rating_agg: dict[int, tuple[float, int]],
+        cur_days_approx: int,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Build Bargains, Overpaid, Expiring, and Free Agent radar lists."""
+        def _yr_rat(pid: int) -> float:
+            acc, mc = p_rating_agg.get(pid, (0.0, 0))
+            return round(acc / mc, 3) if mc > 0 else 0.0
+
+        all_contracted_rows = []
+        tier_buckets: dict[int, list[int]] = {}
+        for c in self.data["playerContracts"]["playerContracts"]:
+            pid = int(c.get("playerId", 0) or 0)
+            p = self.players_by_id.get(pid)
+            if not p:
+                continue
+            p_avg = self._player_practical_avg(p)
+            sal = int(c.get("salaryYear", 0) or 0)
+            tier_key = int(p_avg // 2)
+            if sal > 0:
+                tier_buckets.setdefault(tier_key, []).append(sal)
+            all_contracted_rows.append((c, p, round(p_avg, 2)))
+
+        tier_median: dict[int, int] = {}
+        for tk, sals in tier_buckets.items():
+            s_sorted = sorted(sals)
+            tier_median[tk] = s_sorted[len(s_sorted) // 2] if s_sorted else 0
+
+        bargains: list[dict[str, Any]] = []
+        overpaid: list[dict[str, Any]] = []
+        expiring: list[dict[str, Any]] = []
+        for c, p, p_avg in all_contracted_rows:
+            pid = p["id"]
+            tid = int(c.get("teamId", 0) or 0)
+            tname = self.teams_by_id.get(tid, {}).get("name", f"Team #{tid}")
+            sal = int(c.get("salaryYear", 0) or 0)
+            med_sal = tier_median.get(int(p_avg // 2), sal) or max(sal, 1)
+            yr_rat = _yr_rat(pid)
+            benched = bool(c.get("benched", False))
+            ed = c.get("endDate") or {}
+            ed_yr = int(ed.get("year", 0) or 0)
+            ed_mo = int(ed.get("month", 1) or 1)
+            ed_day = int(ed.get("day", 1) or 1)
+            months_left = round(((ed_yr * 365 + (ed_mo - 1) * 30 + ed_day) - cur_days_approx) / 30.4375, 1) if ed_yr else 99.0
+            role, _, _, _ = self._classify_player_role(p.get("skills") or {})
+            row = {
+                "playerId": pid,
+                "name": p.get("name", ""),
+                "age": p.get("age", 0),
+                "nationName": NATIONS.get(p.get("nation", 0), ""),
+                "teamId": tid,
+                "teamName": tname,
+                "bestRole": role,
+                "avgSkill": p_avg,
+                "avgPot": round(self._player_avg_pot(p), 2),
+                "yearRating": yr_rat,
+                "salaryYear": sal,
+                "peerMedianSalary": med_sal,
+                "ratio": round(sal / max(med_sal, 1), 2),
+                "benched": benched,
+                "monthsLeft": months_left,
+                "endDate": f"{ed_yr}-{ed_mo:02d}-{ed_day:02d}" if ed_yr else "-",
+                "languages": self._fmt_lang_set(self._person_fluent_langs(p)),
+                "isFreeAgent": False,
+            }
+            if p_avg >= 12.0 and sal > 0 and not benched and row["ratio"] <= 0.72:
+                bargains.append(row)
+            if sal >= 200000 and (benched or row["ratio"] >= 1.55 or (p_avg < 12.0 and sal >= 300000)):
+                overpaid.append(row)
+            if 0 <= months_left <= 12.5 and p_avg >= 11.0:
+                expiring.append(row)
+
+        free_agents: list[dict[str, Any]] = []
+        for pid, p in self.players_by_id.items():
+            if pid in self.player_contract_by_pid or p.get("setForRetirement"):
+                continue
+            p_avg = round(self._player_practical_avg(p), 2)
+            p_pot = round(self._player_avg_pot(p), 2)
+            role, _, _, _ = self._classify_player_role(p.get("skills") or {})
+            med_sal = tier_median.get(int(p_avg // 2), 0)
+            free_agents.append(
+                {
+                    "playerId": pid,
+                    "name": p.get("name", ""),
+                    "age": p.get("age", 0),
+                    "nationName": NATIONS.get(p.get("nation", 0), ""),
+                    "teamId": 0,
+                    "teamName": "Free Agent",
+                    "bestRole": role,
+                    "avgSkill": p_avg,
+                    "avgPot": p_pot,
+                    "yearRating": _yr_rat(pid),
+                    "salaryYear": 0,
+                    "peerMedianSalary": med_sal,
+                    "ratio": 0.0,
+                    "benched": False,
+                    "monthsLeft": 0.0,
+                    "endDate": "Free Agent",
+                    "languages": self._fmt_lang_set(self._person_fluent_langs(p)),
+                    "isFreeAgent": True,
+                }
+            )
+
+        bargains.sort(key=lambda r: (r["ratio"], -r["avgSkill"], -r["yearRating"]))
+        overpaid.sort(key=lambda r: (-int(r["benched"]), -r["salaryYear"], r["avgSkill"]))
+        expiring.sort(key=lambda r: (-r["avgSkill"], r["monthsLeft"]))
+        free_agents.sort(key=lambda r: (-r["avgSkill"], -r["avgPot"], r["age"]))
+        return {
+            "bargains": bargains[:50],
+            "overpaid": overpaid[:50],
+            "expiring": expiring[:60],
+            "freeAgents": free_agents[:80],
+        }
+
+    def get_manager_helper(
+        self,
+        team_id: int | None = None,
+        target_player_id: int | None = None,
+        role_preset: str = "match",
+    ) -> dict[str, Any]:
+        """Compute Market Radar, Roster Optimizer, Moneyball Replacement Finder, and Wonderkid Scout."""
+        if self.data is None:
+            return {"loaded": False}
+
+        _, _, map_names = self._stats_lookups()
+        map_ids = sorted(map_names.keys())
+        cur_dt = self.data.get("datetime", {}) or {}
+        cur_year = int(cur_dt.get("year", 0) or 0)
+        cur_month = int(cur_dt.get("month", 1) or 1)
+        cur_day = int(cur_dt.get("day", 1) or 1)
+        cur_days_approx = cur_year * 365 + (cur_month - 1) * 30 + cur_day
+
+        p_rating_agg: dict[int, tuple[float, int]] = {}
+        for row in self.data.get("playerCareerStats", {}).get("playerCareerStats", []):
+            if int(row.get("year", 0) or 0) != cur_year:
+                continue
+            mc = int(row.get("matchesWon", 0) or 0) + int(row.get("matchesLost", 0) or 0)
+            if mc > 0:
+                pid = int(row.get("playerId", 0) or 0)
+                pa, pm = p_rating_agg.get(pid, (0.0, 0))
+                p_rating_agg[pid] = (pa + float(row.get("accumulativeRating", 0.0) or 0.0), pm + mc)
+
+        market_radar = self._build_market_radar(p_rating_agg, cur_days_approx)
+        nation_req_langs = self._infer_nation_req_langs()
+
+        user_team_id = int((self.data.get("profile") or {}).get("team", 0) or 0)
+        teams_selector = []
+        for t in self.data["teams"]["teams"]:
+            tid = t["id"]
+            cs = self.get_team_player_contracts(tid)
+            if not cs:
+                continue
+            starters = [self.players_by_id[c["playerId"]] for c in cs if not c.get("benched") and c["playerId"] in self.players_by_id]
+            avg_s = round(sum(self._player_practical_avg(p) for p in starters) / len(starters), 2) if starters else 0.0
+            rh = t.get("rankingHistory") or []
+            wr = int(rh[-1]) if rh else 0
+            teams_selector.append(
+                {
+                    "teamId": tid,
+                    "name": t.get("name", ""),
+                    "worldRank": wr,
+                    "isUserTeam": tid == user_team_id,
+                    "avgSkill": avg_s,
+                }
+            )
+        teams_selector.sort(key=lambda r: (r["worldRank"] == 0, r["worldRank"] if r["worldRank"] > 0 else 9999, -r["avgSkill"]))
+
+        sel_tid = team_id if (team_id and team_id in self.teams_by_id) else (user_team_id if user_team_id in self.teams_by_id else (teams_selector[0]["teamId"] if teams_selector else 0))
+        sel_team = self.teams_by_id.get(sel_tid, {})
+        team_nation = int(sel_team.get("nation", 0) or 0)
+        main_lang_id = int((sel_team.get("teamCohesion") or {}).get("mainLanguage", 13) or 13)
+        main_lang_name = LANGUAGES.get(main_lang_id, f"Lang #{main_lang_id}")
+        hiring_bias = int((sel_team.get("owner") or {}).get("hiringBias", -1))
+        hiring_bias_label = HIRING_BIAS.get(hiring_bias, "Open / Any")
+        req_nat_langs = nation_req_langs.get(team_nation, set())
+
+        def _is_policy_ok(p_obj: dict[str, Any]) -> bool:
+            if hiring_bias == 0:
+                return int(p_obj.get("nation", 0) or 0) == team_nation
+            if hiring_bias == 1 and req_nat_langs:
+                return bool(self._person_fluent_langs(p_obj) & req_nat_langs)
+            return True
+
+        # Roster Optimizer for sel_tid
+        team_cs = self.get_team_player_contracts(sel_tid)
+        gts = sel_team.get("generalTactics") or []
+        active_gt = next((g for g in gts if g.get("active")), gts[0] if gts else {})
+        cur_igl_id = int(active_gt.get("iglId", 0) or 0)
+        cur_awp_id = int(active_gt.get("sniperId", 0) or 0)
+
+        starters_opt: list[dict[str, Any]] = []
+        benched_opt: list[dict[str, Any]] = []
+        for c in team_cs:
+            pid = c["playerId"]
+            p = self.players_by_id.get(pid)
+            if not p:
+                continue
+            sk = p.get("skills") or {}
+            avg_s = round(self._player_practical_avg(p), 2)
+            avg_pot = round(self._player_avg_pot(p), 2)
+            role, awp_s, igl_s, entry_s = self._classify_player_role(sk)
+            fl = self._person_fluent_langs(p)
+            row = {
+                "playerId": pid,
+                "name": p.get("name", ""),
+                "age": int(p.get("age", 0) or 0),
+                "nationName": NATIONS.get(p.get("nation", 0), ""),
+                "avgSkill": avg_s,
+                "avgPot": avg_pot,
+                "bestRole": role,
+                "awpScore": awp_s,
+                "iglScore": igl_s,
+                "entryScore": entry_s,
+                "salaryYear": int(c.get("salaryYear", 0) or 0),
+                "languages": self._fmt_lang_set(fl),
+                "speaksMainLang": main_lang_id in fl,
+                "policyOk": _is_policy_ok(p),
+                "isCurrentIgl": pid == cur_igl_id,
+                "isCurrentAwp": pid == cur_awp_id,
+            }
+            if c.get("benched"):
+                benched_opt.append(row)
+            else:
+                starters_opt.append(row)
+
+        starters_opt.sort(key=lambda r: -r["avgSkill"])
+        benched_opt.sort(key=lambda r: -r["avgSkill"])
+        worst_starter = starters_opt[-1] if starters_opt else None
+        for b in benched_opt:
+            b["upgradeVsWorstStarter"] = round(b["avgSkill"] - worst_starter["avgSkill"], 2) if worst_starter else 0.0
+
+        _, map_comfort_dict = self._team_map_comforts(sel_team, map_ids)
+        map_comforts_sorted = sorted(
+            [{"mapId": mid, "name": map_names[mid], "comfort": map_comfort_dict.get(mid, 50)} for mid in map_ids],
+            key=lambda x: x["comfort"],
+        )
+
+        best_igl = max(starters_opt, key=lambda r: r["iglScore"], default=None)
+        best_awp = max(starters_opt, key=lambda r: r["awpScore"], default=None)
+        alerts: list[dict[str, str]] = []
+        if worst_starter and benched_opt and benched_opt[0]["avgSkill"] > worst_starter["avgSkill"] + 0.1:
+            b0 = benched_opt[0]
+            alerts.append(
+                {
+                    "severity": "warn",
+                    "title": f"Bench Upgrade Available: {b0['name']} ({b0['avgSkill']}) > {worst_starter['name']} ({worst_starter['avgSkill']})",
+                    "detail": f"Promoting {b0['name']} off the bench immediately boosts active floor by +{round(b0['avgSkill'] - worst_starter['avgSkill'], 2)}.",
+                }
+            )
+        if best_igl and cur_igl_id and best_igl["playerId"] != cur_igl_id:
+            cur_igl_row = next((s for s in starters_opt if s["playerId"] == cur_igl_id), None)
+            if cur_igl_row and best_igl["iglScore"] > cur_igl_row["iglScore"] + 0.8:
+                alerts.append(
+                    {
+                        "severity": "info",
+                        "title": f"IGL Role Optimization: {best_igl['name']} ({best_igl['iglScore']}) vs {cur_igl_row['name']} ({cur_igl_row['iglScore']})",
+                        "detail": "Highest Overview/Decisions/Leadership specialist is not assigned primary IGL in active generalTactics.",
+                    }
+                )
+        if best_awp and cur_awp_id and best_awp["playerId"] != cur_awp_id:
+            cur_awp_row = next((s for s in starters_opt if s["playerId"] == cur_awp_id), None)
+            if cur_awp_row and best_awp["awpScore"] > cur_awp_row["awpScore"] + 0.8:
+                alerts.append(
+                    {
+                        "severity": "info",
+                        "title": f"AWP Role Optimization: {best_awp['name']} ({best_awp['awpScore']}) vs {cur_awp_row['name']} ({cur_awp_row['awpScore']})",
+                        "detail": "Another starter scores notably higher on Snipers/Reactions/Composure than your current assigned AWPer.",
+                    }
+                )
+        non_fluent = [s["name"] for s in starters_opt if not s["speaksMainLang"]]
+        if non_fluent:
+            alerts.append(
+                {
+                    "severity": "warn",
+                    "title": f"{len(non_fluent)} starter(s) do not speak {main_lang_name}: {', '.join(non_fluent)}",
+                    "detail": f"Language barrier lowers cohesionFromLanguage; club policy is '{hiring_bias_label}'.",
+                }
+            )
+        policy_bad = [r["name"] for r in starters_opt + benched_opt if not r["policyOk"]]
+        if policy_bad:
+            alerts.append(
+                {
+                    "severity": "bad",
+                    "title": f"Policy Breach Warning ({hiring_bias_label}): {', '.join(policy_bad)}",
+                    "detail": "These contracted players violate this team's owner hiring bias.",
+                }
+            )
+        if map_comforts_sorted and map_comforts_sorted[0]["comfort"] < 65:
+            weak_maps = ", ".join(f"{m['name']} ({m['comfort']})" for m in map_comforts_sorted[:3])
+            alerts.append(
+                {
+                    "severity": "info",
+                    "title": f"Lowest Map Pool Comfort: {weak_maps}",
+                    "detail": "Each 10 points below 50 reduces GetComfortMultiplier and cuts single-map win odds.",
+                }
+            )
+        if not alerts:
+            alerts.append(
+                {
+                    "severity": "ok",
+                    "title": "Optimal Roster & Tactic Alignment",
+                    "detail": f"All 5 starters speak {main_lang_name}, outrate the bench, match owner policy, and align with IGL/AWP specialists.",
+                }
+            )
+
+        team_rh = sel_team.get("rankingHistory") or []
+        team_wages = sum(int(c.get("salaryYear", 0) or 0) for c in team_cs) + sum(int(sc.get("salaryYear", 0) or 0) for sc in self.get_team_staff_contracts(sel_tid))
+        roster_optimizer = {
+            "teamId": sel_tid,
+            "name": sel_team.get("name", ""),
+            "worldRank": int(team_rh[-1]) if team_rh else 0,
+            "avgSkill": round(sum(s["avgSkill"] for s in starters_opt) / len(starters_opt), 2) if starters_opt else 0.0,
+            "mainLanguageId": main_lang_id,
+            "mainLanguageName": main_lang_name,
+            "hiringBias": hiring_bias,
+            "hiringBiasLabel": hiring_bias_label,
+            "balance": int((sel_team.get("teamFinances") or {}).get("currentBalance", 0) or 0),
+            "annualWages": team_wages,
+            "starters": starters_opt,
+            "benched": benched_opt,
+            "alerts": alerts,
+            "mapComforts": map_comforts_sorted,
+            "recommendedRoles": {
+                "bestIglName": best_igl["name"] if best_igl else "-",
+                "bestIglId": best_igl["playerId"] if best_igl else 0,
+                "bestAwpName": best_awp["name"] if best_awp else "-",
+                "bestAwpId": best_awp["playerId"] if best_awp else 0,
+            },
+        }
+
+        # Moneyball Replacement Finder
+        all_skill_keys = [sk["key"] for sk in PLAYER_SKILLS]
+        ref_pid = target_player_id if (target_player_id and target_player_id in self.players_by_id) else (worst_starter["playerId"] if worst_starter else 0)
+        role_templates: dict[str, list[float]] = {
+            "awper": [18 if k in ("snipers", "reactions", "composure", "flicks") else (15 if k in ("crosshairPlacement", "decisions", "consistency") else 12) for k in all_skill_keys],
+            "igl": [18 if k in ("overview", "decisions", "leadership", "teamwork") else (15 if k in ("composure", "utility", "consistency") else 12) for k in all_skill_keys],
+            "entry": [18 if k in ("aggression", "reactions", "flicks", "movement", "rifles") else (15 if k in ("sprayControl", "crosshairPlacement") else 12) for k in all_skill_keys],
+            "support": [18 if k in ("utility", "teamwork", "consistency", "pistols") else (15 if k in ("rifles", "overview", "decisions") else 12) for k in all_skill_keys],
+            "rifler": [18 if k in ("rifles", "sprayControl", "crosshairPlacement", "tracking", "composure") else 12 for k in all_skill_keys],
+        }
+        ref_p = self.players_by_id.get(ref_pid)
+        if role_preset in role_templates:
+            ref_vec = role_templates[role_preset]
+            ref_avg = round(sum(ref_vec[i] for i, k in enumerate(all_skill_keys) if k in self._PRACTICAL_KEYS) / 16.0, 2)
+            ref_info = {"mode": role_preset, "playerId": 0, "name": f"{role_preset.upper()} Role Template", "avgSkill": ref_avg, "bestRole": role_preset.upper()}
+        elif ref_p:
+            rsk = ref_p.get("skills") or {}
+            ref_vec = [float(rsk.get(k, 10) or 10) for k in all_skill_keys]
+            ref_role, _, _, _ = self._classify_player_role(rsk)
+            ref_avg = round(self._player_practical_avg(ref_p), 2)
+            ref_info = {"mode": "player", "playerId": ref_pid, "name": ref_p.get("name", ""), "avgSkill": ref_avg, "bestRole": ref_role}
+        else:
+            ref_vec = [15.0] * len(all_skill_keys)
+            ref_avg = 15.0
+            ref_info = {"mode": "default", "playerId": 0, "name": "Balanced Pro", "avgSkill": 15.0, "bestRole": "Rifler"}
+
+        ref_norm = math.sqrt(sum(v * v for v in ref_vec)) or 1.0
+        candidates: list[dict[str, Any]] = []
+        for pid, p in self.players_by_id.items():
+            if pid == ref_pid or p.get("setForRetirement"):
+                continue
+            c = self.player_contract_by_pid.get(pid)
+            cand_tid = int(c["teamId"]) if c else 0
+            if cand_tid == sel_tid and c and not c.get("benched"):
+                continue
+            sk = p.get("skills") or {}
+            cand_avg = round(self._player_practical_avg(p), 2)
+            if cand_avg < max(10.0, ref_avg - 2.5):
+                continue
+            vec = [float(sk.get(k, 10) or 10) for k in all_skill_keys]
+            c_norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+            cos_sim = sum(a * b for a, b in zip(ref_vec, vec)) / (ref_norm * c_norm)
+            sim_pct = round(max(0.0, min(100.0, cos_sim * 100.0)), 1)
+            cand_pot = round(self._player_avg_pot(p), 2)
+            role, _, _, _ = self._classify_player_role(sk)
+            fl = self._person_fluent_langs(p)
+            sal = int(c.get("salaryYear", 0) or 0) if c else 0
+            benched = bool(c.get("benched", False)) if c else False
+            if c and c.get("endDate"):
+                ed = c["endDate"]
+                ed_yr = int(ed.get("year", 0) or 0)
+                ed_mo = int(ed.get("month", 1) or 1)
+                ed_day = int(ed.get("day", 1) or 1)
+                m_left = round(((ed_yr * 365 + (ed_mo - 1) * 30 + ed_day) - cur_days_approx) / 30.4375, 1) if ed_yr else 99.0
+                ed_str = f"{ed_yr}-{ed_mo:02d}-{ed_day:02d}"
+            else:
+                m_left = 0.0
+                ed_str = "Free Agent"
+            score = cand_avg * 2.5 + (sim_pct - 90.0) * 0.25 + (1.5 if not c else (0.8 if benched or m_left <= 6 else 0.0)) + (1.0 if main_lang_id in fl else 0.0)
+            candidates.append(
+                {
+                    "playerId": pid,
+                    "name": p.get("name", ""),
+                    "age": int(p.get("age", 0) or 0),
+                    "nationName": NATIONS.get(p.get("nation", 0), ""),
+                    "teamId": cand_tid,
+                    "teamName": self.teams_by_id[cand_tid]["name"] if cand_tid in self.teams_by_id else "Free Agent",
+                    "isFreeAgent": cand_tid == 0,
+                    "benched": benched,
+                    "avgSkill": cand_avg,
+                    "avgPot": cand_pot,
+                    "skillDelta": round(cand_avg - ref_avg, 2),
+                    "similarityPct": sim_pct,
+                    "bestRole": role,
+                    "salaryYear": sal,
+                    "monthsLeft": m_left,
+                    "endDate": ed_str,
+                    "speaksMainLang": main_lang_id in fl,
+                    "policyOk": _is_policy_ok(p),
+                    "languages": self._fmt_lang_set(fl),
+                    "fitScore": round(score, 2),
+                }
+            )
+        candidates.sort(key=lambda r: (-r["fitScore"], -r["avgSkill"], -r["similarityPct"]))
+
+        # Wonderkid & Hidden Gem Scout (U21)
+        wonderkids: list[dict[str, Any]] = []
+        for pid, p in self.players_by_id.items():
+            age = int(p.get("age", 0) or 0)
+            if age <= 0 or age > 21 or p.get("setForRetirement"):
+                continue
+            avg_s = round(self._player_practical_avg(p), 2)
+            avg_pot = round(self._player_avg_pot(p), 2)
+            if avg_pot < 13.5:
+                continue
+            c = self.player_contract_by_pid.get(pid)
+            tid = int(c["teamId"]) if c else 0
+            ed = (c.get("endDate") or {}) if c else {}
+            ed_yr = int(ed.get("year", 0) or 0)
+            m_left = round(((ed_yr * 365 + (int(ed.get("month", 1) or 1) - 1) * 30 + int(ed.get("day", 1) or 1)) - cur_days_approx) / 30.4375, 1) if ed_yr else 0.0
+            role, _, _, _ = self._classify_player_role(p.get("skills") or {})
+            fl = self._person_fluent_langs(p)
+            wonderkids.append(
+                {
+                    "playerId": pid,
+                    "name": p.get("name", ""),
+                    "age": age,
+                    "nationName": NATIONS.get(p.get("nation", 0), ""),
+                    "teamId": tid,
+                    "teamName": self.teams_by_id[tid]["name"] if tid in self.teams_by_id else "Free Agent",
+                    "isFreeAgent": tid == 0,
+                    "benched": bool(c.get("benched", False)) if c else False,
+                    "bestRole": role,
+                    "avgSkill": avg_s,
+                    "avgPot": avg_pot,
+                    "headroom": round(avg_pot - avg_s, 2),
+                    "salaryYear": int(c.get("salaryYear", 0) or 0) if c else 0,
+                    "monthsLeft": m_left,
+                    "speaksMainLang": main_lang_id in fl,
+                    "languages": self._fmt_lang_set(fl),
+                }
+            )
+        wonderkids.sort(key=lambda r: (-r["avgPot"], -r["avgSkill"], r["age"]))
+
+        return {
+            "loaded": True,
+            "teams": teams_selector,
+            "marketRadar": market_radar,
+            "rosterOptimizer": roster_optimizer,
+            "replacementFinder": {
+                "reference": ref_info,
+                "candidates": candidates[:120],
+            },
+            "wonderkids": wonderkids[:60],
+        }
+
+    # ------------------------------------------------------------------
+    # God Mode Lab: League Balancing, Skill Smoothing, Floor Boost, AI Fixer
+    # ------------------------------------------------------------------
+
+    def _god_sync_potential_caps(self, player: dict[str, Any]) -> None:
+        """Ensure every skill's potential limit >= ceil(current skill)."""
+        sk = player.get("skills") or {}
+        pot = player.get("potential")
+        if not isinstance(pot, dict) or "m_Keys" not in pot or "m_Values" not in pot:
+            pot = {"m_Keys": [m["id"] for m in PLAYER_SKILLS], "m_Values": [20 for _ in PLAYER_SKILLS]}
+            player["potential"] = pot
+        pmap = {int(k): int(v) for k, v in zip(pot["m_Keys"], pot["m_Values"])}
+        keys = [m["id"] for m in PLAYER_SKILLS]
+        vals = [
+            int(_clamp(max(pmap.get(m["id"], 15), int(math.ceil(float(sk.get(m["key"], 10) or 10)))), 1, 20))
+            for m in PLAYER_SKILLS
+        ]
+        pot["m_Keys"] = keys
+        pot["m_Values"] = vals
+
+    def _god_set_player_target_avg(
+        self,
+        player: dict[str, Any],
+        target_avg: float,
+        max_skill_cap: float = 20.0,
+    ) -> tuple[float, float]:
+        """Shift a player's skills cleanly so their 16-skill practical avg reaches target_avg (respecting 1..max_skill_cap)."""
+        sk = player.get("skills") or {}
+        old_avg = round(self._player_practical_avg(player), 2)
+        target_avg = float(_clamp(target_avg, 1.0, max_skill_cap))
+        for _ in range(5):
+            cur_avg = self._player_practical_avg(player)
+            diff = target_avg - cur_avg
+            if abs(diff) < 0.015:
+                break
+            for m in PLAYER_SKILLS:
+                k = m["key"]
+                v = float(sk.get(k, 10.0) or 10.0)
+                cap = max_skill_cap if k in self._PRACTICAL_KEYS else 20.0
+                sk[k] = round(float(_clamp(v + diff, 1.0, cap)), 2)
+        if max_skill_cap < 20.0:
+            for k in self._PRACTICAL_KEYS:
+                sk[k] = round(min(max_skill_cap, float(sk.get(k, 10.0) or 10.0)), 2)
+        self._god_sync_potential_caps(player)
+        new_avg = round(self._player_practical_avg(player), 2)
+        return old_avg, new_avg
+
+    def _god_parity_snapshot(self) -> dict[str, Any]:
+        """Compute lightweight Before/After league parity telemetry across Top-20 teams."""
+        assert self.data is not None
+        user_tid = int((self.data.get("profile") or {}).get("team", 0) or 0)
+        rows = []
+        for t in self.data["teams"]["teams"]:
+            tid = t["id"]
+            pcs = self.get_team_player_contracts(tid)
+            starters = [self.players_by_id[c["playerId"]] for c in pcs if not c.get("benched") and c["playerId"] in self.players_by_id]
+            if not starters:
+                continue
+            avgs = [self._player_practical_avg(p) for p in starters]
+            rh = t.get("rankingHistory") or []
+            wr = int(rh[-1]) if rh else 0
+            benched = [self.players_by_id[c["playerId"]] for c in pcs if c.get("benched") and c["playerId"] in self.players_by_id]
+            best_bench = max((self._player_practical_avg(bp) for bp in benched), default=0.0)
+            floor_s = min(avgs)
+            rows.append(
+                {
+                    "teamId": tid,
+                    "name": t.get("name", ""),
+                    "worldRank": wr,
+                    "isUserTeam": tid == user_tid,
+                    "avgSkill": round(sum(avgs) / len(avgs), 2),
+                    "weakestFloor": round(floor_s, 2),
+                    "benchWaste": round(max(0.0, best_bench - floor_s), 2),
+                    "balance": int((t.get("teamFinances") or {}).get("currentBalance", 0) or 0),
+                }
+            )
+        rows.sort(key=lambda r: (r["worldRank"] == 0, r["worldRank"] if r["worldRank"] > 0 else 9999, -r["avgSkill"]))
+        top10 = [r for r in rows if r["worldRank"] > 0][:10] or rows[:10]
+        top20 = [r for r in rows if r["worldRank"] > 0][:20] or rows[:20]
+        user_row = next((r for r in rows if r["isUserTeam"]), rows[0] if rows else None)
+        t10_avg = round(sum(r["avgSkill"] for r in top10) / len(top10), 2) if top10 else 0.0
+        t20_avg = round(sum(r["avgSkill"] for r in top20) / len(top20), 2) if top20 else 0.0
+        max_row = max(top20, key=lambda r: r["avgSkill"], default=None)
+        min_t10 = min(top10, key=lambda r: r["avgSkill"], default=None)
+        return {
+            "userTeamName": user_row["name"] if user_row else "-",
+            "userAvgSkill": user_row["avgSkill"] if user_row else 0.0,
+            "userFloor": user_row["weakestFloor"] if user_row else 0.0,
+            "top10AvgSkill": t10_avg,
+            "top20AvgSkill": t20_avg,
+            "top10Spread": round((max_row["avgSkill"] - min_t10["avgSkill"]), 2) if (max_row and min_t10) else 0.0,
+            "top10Gini": self._gini([r["avgSkill"] for r in top10]),
+            "aiBenchSabotagesTop20": sum(1 for r in top20 if not r["isUserTeam"] and r["benchWaste"] >= 0.25),
+            "teamsList": rows,
+        }
+
+    def _god_scoped_teams(self, scope: str, include_user: bool) -> list[tuple[dict[str, Any], int]]:
+        """Return [(team_dict, world_rank), ...] ordered by world rank matching scope."""
+        assert self.data is not None
+        user_tid = int((self.data.get("profile") or {}).get("team", 0) or 0)
+        ranked = []
+        for t in self.data["teams"]["teams"]:
+            tid = t["id"]
+            if not include_user and tid == user_tid:
+                continue
+            pcs = self.get_team_player_contracts(tid)
+            if not any(not c.get("benched") for c in pcs):
+                continue
+            rh = t.get("rankingHistory") or []
+            wr = int(rh[-1]) if rh else 0
+            ranked.append((t, wr))
+        ranked.sort(key=lambda x: (x[1] == 0, x[1] if x[1] > 0 else 9999, -int(x[0].get("reputation", 1) or 1)))
+        limit = {"top10": 10, "top20": 20, "top30": 30}.get(scope, 9999)
+        return ranked[:limit]
+
+    def get_god_mode_state(self) -> dict[str, Any]:
+        """Return lightweight overview + team list + suggested star protection for God Mode."""
+        if self.data is None:
+            return {"loaded": False}
+        snap = self._god_parity_snapshot()
+        user_tid = int((self.data.get("profile") or {}).get("team", 0) or 0)
+        top_user_star = ""
+        if user_tid in self.teams_by_id:
+            pcs = self.get_team_player_contracts(user_tid)
+            stars = [self.players_by_id[c["playerId"]] for c in pcs if not c.get("benched") and c["playerId"] in self.players_by_id]
+            if stars:
+                best_p = max(stars, key=self._player_practical_avg)
+                top_user_star = best_p.get("name", "")
+        return {
+            "loaded": True,
+            "snapshot": {k: v for k, v in snap.items() if k != "teamsList"},
+            "teams": [
+                {
+                    "teamId": r["teamId"],
+                    "name": r["name"],
+                    "worldRank": r["worldRank"],
+                    "isUserTeam": r["isUserTeam"],
+                    "avgSkill": r["avgSkill"],
+                    "weakestFloor": r["weakestFloor"],
+                }
+                for r in snap["teamsList"][:40]
+            ],
+            "defaultProtectedStar": top_user_star,
+        }
+
+    def run_god_mode(self, action: str, params: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
+        """Execute (or preview) a God Mode league-balancing / smoothing / AI-fixer action."""
+        if self.data is None:
+            raise RuntimeError("No save file is currently loaded.")
+        if dry_run:
+            clone = SaveSession()
+            clone.data = copy.deepcopy(self.data)
+            clone.rebuild_indices()
+            res = clone.run_god_mode(action, params, dry_run=False)
+            res["dryRun"] = True
+            return res
+
+        before_snap = self._god_parity_snapshot()
+        protected_raw = str(params.get("protectedNames") or "")
+        protected_set = {x.strip().lower() for x in protected_raw.split(",") if x.strip()}
+        changes: list[dict[str, Any]] = []
+        summary_lines: list[str] = []
+
+        if action == "boost_floor_parity":
+            scope = str(params.get("scope", "top20"))
+            mode = str(params.get("mode", "floor"))
+            target_floor = float(params.get("targetFloor", 15.8))
+            smooth_target = float(params.get("smoothTarget", 16.2))
+            strength_pct = float(_clamp(float(params.get("strengthPct", 75.0)), 5.0, 100.0)) / 100.0
+            boost_delta = float(_clamp(float(params.get("boostDelta", 1.2)), 0.1, 6.0))
+            protect_user = bool(params.get("protectUserTeam", True))
+
+            targets = self._god_scoped_teams(scope, include_user=not protect_user)
+            for t, wr in targets:
+                pcs = self.get_team_player_contracts(t["id"])
+                starters = [self.players_by_id[c["playerId"]] for c in pcs if not c.get("benched") and c["playerId"] in self.players_by_id]
+                if not starters:
+                    continue
+                starters.sort(key=self._player_practical_avg)
+                if mode == "weakest_slot_boost":
+                    to_edit = starters[:2]
+                    for p in to_edit:
+                        if p.get("name", "").lower() in protected_set:
+                            continue
+                        cur = self._player_practical_avg(p)
+                        old_a, new_a = self._god_set_player_target_avg(p, min(19.5, cur + boost_delta))
+                        if abs(new_a - old_a) >= 0.02:
+                            changes.append({"target": p["name"], "team": t["name"], "detail": f"Weakest-slot floor {old_a} -> {new_a}"})
+                else:
+                    team_avg = sum(self._player_practical_avg(p) for p in starters) / len(starters)
+                    for p in starters:
+                        if p.get("name", "").lower() in protected_set:
+                            continue
+                        cur = self._player_practical_avg(p)
+                        if mode == "floor":
+                            if cur >= target_floor:
+                                continue
+                            desired = cur + (target_floor - cur) * strength_pct
+                        else:
+                            # smooth_toward_target shifts players relative to team avg -> smooth_target
+                            team_shift = (smooth_target - team_avg) * strength_pct
+                            desired = cur + team_shift
+                        old_a, new_a = self._god_set_player_target_avg(p, desired)
+                        if abs(new_a - old_a) >= 0.02:
+                            changes.append({"target": p["name"], "team": t["name"], "detail": f"Avg skill {old_a} -> {new_a}"})
+            summary_lines.append(f"Adjusted {len(changes)} starter(s) across {len(targets)} teams ({scope}, mode={mode}).")
+
+        elif action == "nerf_superteam_keep_stars":
+            tid = int(params.get("teamId") or (self.data.get("profile") or {}).get("team", 0) or 0)
+            team = self.teams_by_id.get(tid)
+            if not team:
+                raise ValueError(f"Team {tid} not found.")
+            target_avg = float(_clamp(float(params.get("targetAvg", 16.2)), 10.0, 19.5))
+            cap_non = float(_clamp(float(params.get("capNonProtected", 17.2)), 10.0, 20.0))
+            pcs = self.get_team_player_contracts(tid)
+            starters = [self.players_by_id[c["playerId"]] for c in pcs if not c.get("benched") and c["playerId"] in self.players_by_id]
+            prot_players = [p for p in starters if p.get("name", "").lower() in protected_set]
+            edit_players = [p for p in starters if p.get("name", "").lower() not in protected_set]
+            if not edit_players:
+                raise ValueError("No unprotected starters left on this team to adjust.")
+            prot_sum = sum(self._player_practical_avg(p) for p in prot_players)
+            desired_edit_mean = (target_avg * len(starters) - prot_sum) / len(edit_players)
+            cur_edit_mean = sum(self._player_practical_avg(p) for p in edit_players) / len(edit_players)
+            shift = desired_edit_mean - cur_edit_mean
+            for p in edit_players:
+                cur = self._player_practical_avg(p)
+                old_a, new_a = self._god_set_player_target_avg(p, cur + shift, max_skill_cap=cap_non)
+                changes.append({"target": p["name"], "team": team["name"], "detail": f"Teammate smoothed {old_a} -> {new_a}"})
+            for pp in prot_players:
+                changes.append({"target": pp["name"], "team": team["name"], "detail": f"PROTECTED ({round(self._player_practical_avg(pp), 2)} avg untouched)"})
+            summary_lines.append(f"Smoothed {team['name']} teammates around protected star(s): {', '.join(p['name'] for p in prot_players) or 'None'}.")
+
+        elif action == "fix_ai_sabotage":
+            scope = str(params.get("scope", "top20"))
+            fix_bench = bool(params.get("fixBench", True))
+            min_map_c = int(params.get("minMapComfort", 65) or 0)
+            sync_langs = bool(params.get("syncLanguages", True))
+            min_staff = float(params.get("minStaffSkill", 15.5) or 0)
+            burnout_top = bool(params.get("applyBurnoutToTopTeams", False))
+
+            targets = self._god_scoped_teams(scope, include_user=False)
+            for t, wr in targets:
+                tid = t["id"]
+                if fix_bench:
+                    pcs = self.get_team_player_contracts(tid)
+                    act = [self.players_by_id[c["playerId"]] for c in pcs if not c.get("benched") and c["playerId"] in self.players_by_id]
+                    ben = [self.players_by_id[c["playerId"]] for c in pcs if c.get("benched") and c["playerId"] in self.players_by_id]
+                    act.sort(key=self._player_practical_avg)
+                    ben.sort(key=lambda bp: -self._player_practical_avg(bp))
+                    swapped = False
+                    while act and ben and self._player_practical_avg(ben[0]) > self._player_practical_avg(act[0]) + 0.25:
+                        up = ben.pop(0)
+                        dn = act.pop(0)
+                        c_up = self.player_contract_by_pid[up["id"]]
+                        c_dn = self.player_contract_by_pid[dn["id"]]
+                        c_up["benched"] = False
+                        c_dn["benched"] = True
+                        self.remove_player_from_tactics(t, dn["id"])
+                        swapped = True
+                        changes.append({"target": f"{up['name']} <-> {dn['name']}", "team": t["name"], "detail": "Promoted stronger bench player"})
+                    if swapped:
+                        self.recalculate_ai_tactics(tid)
+
+                if min_map_c > 0:
+                    gts = t.get("generalTactics") or []
+                    active_gt = next((g for g in gts if g.get("active")), gts[0] if gts else {})
+                    gen_k = int(float(active_gt.get("knowledge", 0.0) or 0.0))
+                    boosted_maps = 0
+                    for mt in t.get("mapTactics") or []:
+                        cur_c = gen_k + int(mt.get("knowledgeFromPlayers", 0) or 0) + int(mt.get("knowledgeFromTraining", 0) or 0)
+                        if cur_c < min_map_c:
+                            mt["knowledgeFromTraining"] = int(mt.get("knowledgeFromTraining", 0) or 0) + (min_map_c - cur_c)
+                            boosted_maps += 1
+                    if boosted_maps:
+                        changes.append({"target": "Map Prep", "team": t["name"], "detail": f"Raised {boosted_maps} maps to >= {min_map_c} comfort"})
+
+                if sync_langs:
+                    main_lid = int((t.get("teamCohesion") or {}).get("mainLanguage", 13) or 13)
+                    pcs = self.get_team_player_contracts(tid)
+                    for c in pcs:
+                        if c.get("benched"):
+                            continue
+                        p = self.players_by_id.get(c["playerId"])
+                        if not p:
+                            continue
+                        langs = p.get("languagesSpoken") or []
+                        entry = next((lg for lg in langs if int(lg.get("languageId", 0) or 0) == main_lid), None)
+                        if entry and int(entry.get("languageSkill", 0) or 0) < 15:
+                            entry["languageSkill"] = 16
+                            entry["limit"] = max(16, int(entry.get("limit", 16) or 16))
+                            changes.append({"target": p["name"], "team": t["name"], "detail": f"Added fluent {LANGUAGES.get(main_lid, 'Main Lang')}"})
+                        elif not entry:
+                            langs.append({"languageId": main_lid, "languageSkill": 16, "limit": 20, "progress": 0.0})
+                            p["languagesSpoken"] = langs
+                            changes.append({"target": p["name"], "team": t["name"], "detail": f"Added fluent {LANGUAGES.get(main_lid, 'Main Lang')}"})
+
+                if min_staff > 0:
+                    for sc in self.get_team_staff_contracts(tid):
+                        so = self.staff_by_id.get(sc["staffId"])
+                        if not so:
+                            continue
+                        ss = so.get("skills") or {}
+                        cur_s = _staff_avg_skill(so)
+                        if cur_s < min_staff:
+                            delta_s = min_staff - cur_s
+                            for sk_m in STAFF_SKILLS:
+                                k = sk_m["key"]
+                                ss[k] = round(float(_clamp(float(ss.get(k, 10) or 10) + delta_s, 1.0, 20.0)), 2)
+                            changes.append({"target": so.get("name", "Staff"), "team": t["name"], "detail": f"Staff avg {cur_s} -> {round(_staff_avg_skill(so), 2)}"})
+
+            if burnout_top:
+                for t, wr in self._god_scoped_teams("top10", include_user=True)[:3]:
+                    coh = t.setdefault("teamCohesion", {})
+                    old_b = float(coh.get("cohesionFromBurnout", 1.0) or 1.0)
+                    coh["cohesionFromBurnout"] = min(old_b, 0.78)
+                    changes.append({"target": "Schedule Burnout", "team": t["name"], "detail": f"cohesionFromBurnout {round(old_b, 2)} -> {round(coh['cohesionFromBurnout'], 2)}"})
+
+            summary_lines.append(f"Applied {len(changes)} AI/prep/burnout adjustments across {scope}.")
+
+        elif action == "rebalance_economy":
+            scope = str(params.get("scope", "top20"))
+            min_bal = int(params.get("minBalance", 1500000) or 0)
+            max_cap = int(params.get("maxBalanceCap", 0) or 0)
+            min_fac = int(_clamp(int(params.get("minFacilityLevel", 3) or 0), 0, 4))
+            targets = self._god_scoped_teams(scope, include_user=False)
+            for t, wr in targets:
+                fin = t.setdefault("teamFinances", {})
+                bal = int(fin.get("currentBalance", 0) or 0)
+                if min_bal > 0 and bal < min_bal:
+                    fin["currentBalance"] = min_bal
+                    changes.append({"target": "Cash Grant", "team": t["name"], "detail": f"${bal:,} -> ${min_bal:,}"})
+                if min_fac > 0:
+                    upgraded = []
+                    for fk in ("coffeeMachine", "recreation", "cable", "ventilation", "academy"):
+                        if int(t.get(fk, 0) or 0) < min_fac:
+                            t[fk] = min_fac
+                            upgraded.append(fk)
+                    if upgraded:
+                        changes.append({"target": "Facilities", "team": t["name"], "detail": f"Upgraded {', '.join(upgraded)} >= Lv{min_fac}"})
+            if max_cap > 0:
+                for t, wr in self._god_scoped_teams("top30", include_user=True):
+                    fin = t.setdefault("teamFinances", {})
+                    bal = int(fin.get("currentBalance", 0) or 0)
+                    if bal > max_cap:
+                        fin["currentBalance"] = max_cap
+                        changes.append({"target": "Wealth Cap", "team": t["name"], "detail": f"Capped ${bal:,} -> ${max_cap:,}"})
+            summary_lines.append(f"Rebalanced finances & facilities ({len(changes)} updates).")
+
+        elif action == "inject_wonderkids":
+            cnt = int(_clamp(int(params.get("count", 10)), 1, 25))
+            age_lo = int(_clamp(int(params.get("minAge", 16)), 15, 21))
+            age_hi = int(_clamp(int(params.get("maxAge", 18)), age_lo, 22))
+            sk_lo = float(_clamp(float(params.get("skillMin", 12.0)), 8.0, 18.0))
+            sk_hi = float(_clamp(float(params.get("skillMax", 14.5)), sk_lo, 19.0))
+            pot_lo = float(_clamp(float(params.get("potMin", 17.5)), 14.0, 20.0))
+            pot_hi = float(_clamp(float(params.get("potMax", 19.5)), pot_lo, 20.0))
+            assign_mode = str(params.get("assignMode", "free_agents"))
+            nation_mode = str(params.get("nationMode", "diverse_pro"))
+
+            nation_pools = {
+                "eu": [27, 93, 34, 36, 78, 33, 70, 66, 91, 79, 26],
+                "cis": [82, 99, 51, 12, 35, 53, 55, 31],
+                "americas": [16, 102, 18, 5, 19, 103],
+                "asia": [62, 20, 90, 98, 7, 67, 43],
+            }
+            nat_choices = nation_pools.get(nation_mode) or (nation_pools["eu"] + nation_pools["cis"] + nation_pools["americas"] + nation_pools["asia"])
+            handles_a = ["kaze", "nyx", "r0nin", "vex", "z3n", "koda", "s1mpleX", "mizu", "falk", "draco", "lyra", "tarkov", "volt", "haze", "flint", "nexaR", "solis", "kr1s", "axel", "bastian", "vortex", "juno", "skye", "torin", "rexx"]
+            roles = ["AWPer", "Entry", "Rifler", "IGL", "Support"]
+            existing_names = {p.get("name", "").lower() for p in self.players_by_id.values()}
+            ai_teams = [t for t, _ in self._god_scoped_teams("top20", include_user=False)]
+
+            for idx in range(cnt):
+                base_h = handles_a[idx % len(handles_a)]
+                cand_name = base_h if base_h.lower() not in existing_names else f"{base_h}{random.randint(10, 99)}"
+                existing_names.add(cand_name.lower())
+                role = roles[idx % len(roles)]
+                age_val = random.randint(age_lo, age_hi)
+                nid = random.choice(nat_choices)
+                base_sk = round(random.uniform(sk_lo, sk_hi), 1)
+                base_pot = int(round(random.uniform(pot_lo, pot_hi)))
+
+                role_bumps = {
+                    "AWPer": {"snipers": 3.5, "reactions": 2.0, "composure": 1.5, "flicks": 1.5},
+                    "Entry": {"aggression": 3.0, "reactions": 2.0, "flicks": 2.0, "movement": 1.5, "rifles": 2.0},
+                    "IGL": {"overview": 3.0, "decisions": 3.0, "leadership": 3.5, "teamwork": 2.5},
+                    "Support": {"utility": 3.0, "teamwork": 3.0, "consistency": 2.0, "pistols": 1.5},
+                    "Rifler": {"rifles": 3.0, "sprayControl": 2.5, "crosshairPlacement": 2.0, "tracking": 1.5},
+                }[role]
+                sk_dict = {
+                    m["key"]: round(float(_clamp(base_sk + role_bumps.get(m["key"], random.uniform(-0.8, 0.8)), 5.0, 19.5)), 1)
+                    for m in PLAYER_SKILLS
+                }
+                pot_keys = [m["id"] for m in PLAYER_SKILLS]
+                pot_vals = [int(_clamp(max(base_pot, math.ceil(sk_dict[m["key"]])), 10, 20)) for m in PLAYER_SKILLS]
+
+                target_tid = 0
+                if assign_mode == "top20_bench" and ai_teams:
+                    target_tid = ai_teams[idx % len(ai_teams)]["id"]
+
+                created = self.create_player(
+                    {
+                        "player": {
+                            "name": cand_name,
+                            "age": age_val,
+                            "nation": nid,
+                            "reputation": 10,
+                            "preferredMentality": 1,
+                            "skills": sk_dict,
+                            "potential": {"m_Keys": pot_keys, "m_Values": pot_vals},
+                            "academyPlayer": False,
+                        },
+                        "targetTeamId": target_tid,
+                        "joinBenched": True if target_tid > 0 else False,
+                        "salaryYear": 120000 if target_tid > 0 else 0,
+                    }
+                )
+                p_new = created["player"]
+                tname = self.teams_by_id[target_tid]["name"] if target_tid in self.teams_by_id else "Free Agent"
+                changes.append({"target": f"{p_new['name']} ({age_val}y {role})", "team": tname, "detail": f"Avg {round(self._player_practical_avg(p_new), 2)} / Pot {base_pot}"})
+            summary_lines.append(f"Spawned {cnt} U21 {nation_mode} wonderkids ({assign_mode}).")
+
+        else:
+            raise ValueError(f"Unknown God Mode action: {action}")
+
+        self.dirty = True
+        after_snap = self._god_parity_snapshot()
+        return {
+            "ok": True,
+            "dryRun": False,
+            "action": action,
+            "summary": " ".join(summary_lines),
+            "changeCount": len(changes),
+            "changes": changes[:150],
+            "before": {k: v for k, v in before_snap.items() if k != "teamsList"},
+            "after": {k: v for k, v in after_snap.items() if k != "teamsList"},
+        }
+
+
+
