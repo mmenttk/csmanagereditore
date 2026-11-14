@@ -1,0 +1,1046 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CS Manager Save Editor</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-row">
+      <div class="brand">
+        <span class="brand-badge">CSM</span>
+        <span class="brand-title">CS Manager Save Editor</span>
+      </div>
+      <div class="save-controls">
+        <select id="savePicker" class="save-select" title="Discovered saves"></select>
+        <button id="btnLoadSelected" class="btn">Load</button>
+        <button id="btnBrowsePath" class="btn" title="Open file picker (native Explorer/Finder on desktop, or upload on mobile/remote)">Browse File...</button>
+        <button id="btnUploadSave" class="btn" title="Upload a .json save from your browser/device">Upload .json</button>
+        <input id="uploadSaveInput" type="file" accept=".json,application/json" hidden />
+        <button id="btnOpenFolder" class="btn" title="Open save folder on host desktop">Open Folder</button>
+        <button id="btnValidate" class="btn btn-blue">Validate &amp; Fix</button>
+        <button id="btnSave" class="btn btn-primary">Save (with Backup)</button>
+        <button id="btnSaveAs" class="btn btn-success" title="Save As via file dialog or download on remote device">Save As...</button>
+        <button id="btnDownloadSave" class="btn btn-success" title="Download edited save .json to your browser/device">Download .json</button>
+      </div>
+    </div>
+    <div class="status-bar" id="statusBar">
+      <span class="muted">No save loaded.</span>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab-btn active" data-tab="transfers">Transfers</button>
+    <button class="tab-btn" data-tab="players">Players</button>
+    <button class="tab-btn" data-tab="staff">Staff</button>
+    <button class="tab-btn" data-tab="teams">Orgs / Teams</button>
+    <button class="tab-btn" data-tab="stats">Stats</button>
+    <button class="tab-btn" data-tab="showcase">Bug Showcase</button>
+  </nav>
+
+  <main class="container">
+    <!-- ==================== TRANSFERS TAB ==================== -->
+    <section id="tab-transfers" class="tab-panel active">
+      <div class="two-col">
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">Player Transfer</h2>
+            <span class="pill pill-blue">Updates contracts, tactics, history &amp; mood</span>
+          </div>
+
+          <div class="subcard">
+            <div class="subcard-title">1. Select Player &amp; Destination</div>
+            <div class="form-grid-2">
+              <div class="field">
+                <label>Filter Player Name / ID</label>
+                <input id="txPlayerSearch" type="text" placeholder="Type e.g. YEKINDAR, donk, m0NESY..." />
+              </div>
+              <div class="field">
+                <label>Select Player</label>
+                <select id="txPlayerSelect"></select>
+              </div>
+            </div>
+            <div id="txPlayerSummary" class="muted" style="margin-top:8px;font-size:12px;"></div>
+
+            <div class="form-grid-2" style="margin-top:10px;">
+              <div class="field">
+                <label>Filter Target Team</label>
+                <input id="txTeamSearch" type="text" placeholder="Type team name..." />
+              </div>
+              <div class="field">
+                <label>Target Team</label>
+                <select id="txTargetTeam"></select>
+              </div>
+            </div>
+          </div>
+
+          <div class="subcard">
+            <div class="subcard-title">2. Contract &amp; Transfer Terms</div>
+            <div class="form-grid">
+              <div class="field">
+                <label>Annual Salary ($)</label>
+                <input id="txSalary" type="number" step="1000" />
+              </div>
+              <div class="field">
+                <label>Contract End Date (ISO)</label>
+                <input id="txEndDate" type="text" placeholder="2028-12-31T00:00:00" />
+              </div>
+              <div class="field">
+                <label>Contract Type</label>
+                <select id="txContractType"></select>
+              </div>
+              <div class="field">
+                <label>Squad Status</label>
+                <select id="txPlayerStatus"></select>
+              </div>
+              <div class="field">
+                <label>IGL Role</label>
+                <select id="txIglRole"></select>
+              </div>
+              <div class="field">
+                <label>Sniper / AWP Role</label>
+                <select id="txSniperRole"></select>
+              </div>
+              <div class="field">
+                <label>Buyout / Fee ($)</label>
+                <input id="txBuyout" type="number" step="1000" value="0" />
+              </div>
+              <div class="field">
+                <label>Signing-On Fee ($)</label>
+                <input id="txSignFee" type="number" step="1000" value="0" />
+              </div>
+            </div>
+
+            <div class="form-grid-2" style="margin-top:8px;">
+              <div class="checkbox-row">
+                <input id="txApplyFinances" type="checkbox" checked />
+                <label for="txApplyFinances">Deduct buyer / credit seller finances</label>
+              </div>
+              <div class="checkbox-row">
+                <input id="txJoinBenched" type="checkbox" />
+                <label for="txJoinBenched">Sign player directly onto bench</label>
+              </div>
+              <div class="checkbox-row">
+                <input id="txAutoPromoteOld" type="checkbox" checked />
+                <label for="txAutoPromoteOld">Auto-promote bench on old team if &lt; 5</label>
+              </div>
+            </div>
+          </div>
+
+          <div class="inline-actions" style="justify-content:space-between;margin-top:10px;">
+            <span id="txBenchHint" class="muted" style="font-size:12px;">Optional: pick a starter on the right to bench during transfer.</span>
+            <button id="btnExecutePlayerTransfer" class="btn btn-primary">Execute Player Transfer</button>
+          </div>
+        </div>
+
+        <div>
+          <div class="card" style="margin-bottom:16px;">
+            <div class="card-header">
+              <h2 class="card-title">Target Team Active Roster &amp; Benching</h2>
+              <button id="btnTxRecalcTactics" class="btn btn-sm btn-blue">Recalculate AI Tactics</button>
+            </div>
+            <p class="muted" style="margin-top:0;font-size:12px;">
+              Select a starter below to bench them automatically when transferring, or toggle Bench / Promote directly after transferring. AI tactics recalculate automatically.
+            </p>
+            <div id="txTargetRoster"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h2 class="card-title">Staff Transfer</h2>
+              <span class="pill">Coach / Analyst / Scout</span>
+            </div>
+            <div class="form-grid-2">
+              <div class="field">
+                <label>Filter Staff</label>
+                <input id="txStaffSearch" type="text" placeholder="Type staff name..." />
+              </div>
+              <div class="field">
+                <label>Select Staff</label>
+                <select id="txStaffSelect"></select>
+              </div>
+              <div class="field">
+                <label>Target Team</label>
+                <select id="txStaffTargetTeam"></select>
+              </div>
+              <div class="field">
+                <label>New Staff Role</label>
+                <select id="txStaffRole"></select>
+              </div>
+              <div class="field">
+                <label>Annual Salary ($)</label>
+                <input id="txStaffSalary" type="number" step="1000" />
+              </div>
+              <div class="field">
+                <label>Contract End Date</label>
+                <input id="txStaffEndDate" type="text" />
+              </div>
+              <div class="field">
+                <label>Buyout Fee ($)</label>
+                <input id="txStaffBuyout" type="number" step="1000" value="0" />
+              </div>
+              <div class="field" style="justify-content:flex-end;">
+                <div class="checkbox-row">
+                  <input id="txStaffReplace" type="checkbox" checked />
+                  <label for="txStaffReplace">Release existing staff in same role</label>
+                </div>
+                <div class="checkbox-row">
+                  <input id="txStaffApplyFinances" type="checkbox" checked />
+                  <label for="txStaffApplyFinances">Adjust team finances</label>
+                </div>
+              </div>
+            </div>
+            <div style="margin-top:10px;text-align:right;">
+              <button id="btnExecuteStaffTransfer" class="btn btn-primary">Execute Staff Transfer</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="card-header">
+          <h2 class="card-title">Recent Transfer History (Latest 80)</h2>
+          <button id="btnRefreshTransfers" class="btn btn-sm">Refresh</button>
+        </div>
+        <div class="table-wrap" style="max-height:320px;">
+          <table>
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Type</th>
+                <th>Person</th>
+                <th>From</th>
+                <th>To</th>
+                <th>Transfer Type</th>
+                <th>Price</th>
+              </tr>
+            </thead>
+            <tbody id="txHistoryBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== PLAYERS TAB ==================== -->
+    <section id="tab-players" class="tab-panel">
+      <div class="split-layout">
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">Players</h2>
+            <div class="inline-actions">
+              <span id="playersCountLabel" class="muted">0</span>
+              <button id="btnOpenNewPlayer" class="btn btn-sm btn-primary">+ New Player</button>
+            </div>
+          </div>
+          <div class="filter-row">
+            <input id="playerFilterQ" type="text" placeholder="Search name / alias..." />
+            <select id="playerFilterTeam"></select>
+            <select id="playerFilterNation"></select>
+            <div class="checkbox-row">
+              <input id="playerFilterFree" type="checkbox" />
+              <label for="playerFilterFree">Free Agents Only</label>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Player</th>
+                  <th>Team</th>
+                  <th>Nat</th>
+                  <th>Age</th>
+                  <th>Rep</th>
+                </tr>
+              </thead>
+              <tbody id="playersTableBody"></tbody>
+            </table>
+          </div>
+          <div class="pager">
+            <button id="playersPrev" class="btn btn-sm">Prev</button>
+            <span id="playersPageInfo">-</span>
+            <button id="playersNext" class="btn btn-sm">Next</button>
+          </div>
+        </div>
+
+        <div class="card" id="playerEditorCard">
+          <div class="card-header">
+            <h2 class="card-title" id="playerEditorTitle">Select a player to edit</h2>
+            <div class="inline-actions">
+              <button id="btnPlayerApply" class="btn btn-primary" disabled>Apply Changes</button>
+            </div>
+          </div>
+          <div id="playerEditorBody" class="muted">Pick any player from the table on the left.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== STAFF TAB ==================== -->
+    <section id="tab-staff" class="tab-panel">
+      <div class="split-layout">
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">Staff</h2>
+            <div class="inline-actions">
+              <span id="staffCountLabel" class="muted">0</span>
+              <button id="btnOpenNewStaff" class="btn btn-sm btn-primary">+ New Staff</button>
+            </div>
+          </div>
+          <div class="filter-row">
+            <input id="staffFilterQ" type="text" placeholder="Search name / alias..." />
+            <select id="staffFilterTeam"></select>
+            <select id="staffFilterRole"></select>
+            <div class="checkbox-row">
+              <input id="staffFilterFree" type="checkbox" />
+              <label for="staffFilterFree">Free Agents Only</label>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Staff</th>
+                  <th>Team</th>
+                  <th>Role</th>
+                  <th>Age</th>
+                  <th>Rep</th>
+                </tr>
+              </thead>
+              <tbody id="staffTableBody"></tbody>
+            </table>
+          </div>
+          <div class="pager">
+            <button id="staffPrev" class="btn btn-sm">Prev</button>
+            <span id="staffPageInfo">-</span>
+            <button id="staffNext" class="btn btn-sm">Next</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title" id="staffEditorTitle">Select a staff member to edit</h2>
+            <button id="btnStaffApply" class="btn btn-primary" disabled>Apply Changes</button>
+          </div>
+          <div id="staffEditorBody" class="muted">Pick any staff member from the table on the left.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== TEAMS TAB ==================== -->
+    <section id="tab-teams" class="tab-panel">
+      <div class="split-layout">
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">Orgs / Teams</h2>
+            <span id="teamsCountLabel" class="muted">0</span>
+          </div>
+          <div style="margin-bottom:10px;">
+            <input id="teamFilterQ" type="text" placeholder="Search team name..." />
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Org</th>
+                  <th>Rep</th>
+                  <th>Active / Total</th>
+                  <th>Finances</th>
+                </tr>
+              </thead>
+              <tbody id="teamsTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title" id="teamEditorTitle">Select an org to edit</h2>
+            <div class="inline-actions">
+              <button id="btnTeamRecalc" class="btn btn-blue" disabled>Recalculate AI Tactics</button>
+              <button id="btnTeamApply" class="btn btn-primary" disabled>Apply Changes</button>
+            </div>
+          </div>
+          <div id="teamEditorBody" class="muted">Pick any org from the table on the left.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== STATS TAB ==================== -->
+    <section id="tab-stats" class="tab-panel">
+      <div class="card" style="margin-bottom:14px;">
+        <div class="card-header">
+          <h2 class="card-title">Analytics &amp; Career Statistics Hub</h2>
+          <button id="btnStatsRefresh" class="btn btn-sm btn-blue">Refresh Stats</button>
+        </div>
+        <div class="form-grid">
+          <div class="field"><label>Season Year</label><select id="statsFilterYear"></select></div>
+          <div class="field"><label>Filter Team</label><select id="statsFilterTeam"></select></div>
+          <div class="field">
+            <label>Min Maps Played</label>
+            <select id="statsFilterMinMaps">
+              <option value="0" selected>All (0+)</option>
+              <option value="5">5+ Maps</option>
+              <option value="15">15+ Maps</option>
+              <option value="30">30+ Maps</option>
+              <option value="60">60+ Maps</option>
+            </select>
+          </div>
+          <div class="field"><label>Search Player / Team</label><input id="statsFilterQ" type="text" placeholder="Filter by name..." /></div>
+        </div>
+      </div>
+
+      <div class="kpi-grid" id="statsKpiGrid"></div>
+
+      <div class="subtabs">
+        <button class="subtab-btn active" data-subtab="players">Player Leaderboard</button>
+        <button class="subtab-btn" data-subtab="teams">Team Standings &amp; Analytics</button>
+        <button class="subtab-btn" data-subtab="maps">Map Pool Meta</button>
+        <button class="subtab-btn" data-subtab="matches">Match History</button>
+        <button class="subtab-btn" data-subtab="awards">Trophies &amp; Awards</button>
+        <button class="subtab-btn" data-subtab="top20">Top 20 Prediction</button>
+      </div>
+
+      <div id="subtab-players" class="subtab-panel active card">
+        <div class="card-header">
+          <h3 class="card-title">Player Statistics Leaderboard <span class="muted" style="font-weight:400;font-size:12px;">(Click column headers to sort &bull; Click any player for deep breakdown)</span></h3>
+          <span id="statsPlayerCount" class="muted">0</span>
+        </div>
+        <div class="table-wrap" style="max-height:72vh;">
+          <table>
+            <thead>
+              <tr>
+                <th>#</th>
+                <th class="sortable" data-sort="name">Player</th>
+                <th class="sortable" data-sort="teamName">Team</th>
+                <th class="sortable" data-sort="age">Age</th>
+                <th class="sortable" data-sort="avgSkill">Skill</th>
+                <th class="sortable sort-active" data-sort="rating">Rating</th>
+                <th class="sortable" data-sort="matches">M (W-L)</th>
+                <th class="sortable" data-sort="mapsPlayed">Maps</th>
+                <th class="sortable" data-sort="rounds">Rds</th>
+                <th class="sortable" data-sort="kills">K</th>
+                <th class="sortable" data-sort="assists">A</th>
+                <th class="sortable" data-sort="flashAssists">FA</th>
+                <th class="sortable" data-sort="deaths">D</th>
+                <th class="sortable" data-sort="kd">K/D</th>
+                <th class="sortable" data-sort="kDiff">+/-</th>
+                <th class="sortable" data-sort="adr">ADR</th>
+                <th class="sortable" data-sort="hsPct">HS%</th>
+                <th class="sortable" data-sort="openingDiff">OK-OD</th>
+                <th class="sortable" data-sort="sniperKills">AWP K</th>
+                <th class="sortable" data-sort="clutchKills">Clutch K</th>
+                <th class="sortable" data-sort="k5">2K/3K/4K/5K</th>
+                <th class="sortable" data-sort="mvps">Awards</th>
+              </tr>
+            </thead>
+            <tbody id="statsPlayersBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="subtab-teams" class="subtab-panel card">
+        <div class="card-header">
+          <h3 class="card-title">Team Standings &amp; Macro Metrics <span class="muted" style="font-weight:400;font-size:12px;">(Click any org for map pool, rank chart &amp; results)</span></h3>
+          <span id="statsTeamCount" class="muted">0</span>
+        </div>
+        <div class="table-wrap" style="max-height:72vh;">
+          <table>
+            <thead>
+              <tr>
+                <th class="sortable sort-active" data-tsort="worldRank">Rank</th>
+                <th class="sortable" data-tsort="name">Org</th>
+                <th class="sortable" data-tsort="rankingPoints">Points</th>
+                <th class="sortable" data-tsort="avgSkill">Avg Skill</th>
+                <th class="sortable" data-tsort="avgAge">Avg Age</th>
+                <th class="sortable" data-tsort="matchWinPct">Matches W-L</th>
+                <th class="sortable" data-tsort="mapWinPct">Maps W-L</th>
+                <th class="sortable" data-tsort="pistolWinPct">Pistol %</th>
+                <th class="sortable" data-tsort="clutchesWon">Clutches</th>
+                <th class="sortable" data-tsort="titles">Titles / T4</th>
+                <th class="sortable" data-tsort="prizeWon">Prize Won</th>
+                <th class="sortable" data-tsort="balance">Balance</th>
+              </tr>
+            </thead>
+            <tbody id="statsTeamsBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="subtab-maps" class="subtab-panel card">
+        <div class="card-header">
+          <h3 class="card-title">Map Pool Meta Breakdown</h3>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Map</th>
+                <th>Played</th>
+                <th>Total Rounds</th>
+                <th>Avg Rounds / Map</th>
+                <th>Overtime %</th>
+                <th>Picked (Veto)</th>
+                <th>Banned (Veto)</th>
+                <th>Total Kills</th>
+                <th>Aces (5K)</th>
+              </tr>
+            </thead>
+            <tbody id="statsMapsBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="subtab-matches" class="subtab-panel card">
+        <div class="card-header">
+          <h3 class="card-title">Played Matches <span class="muted" style="font-weight:400;font-size:12px;">(Click any match for full veto &amp; 10-player scoreboards)</span></h3>
+        </div>
+        <div class="table-wrap" style="max-height:72vh;">
+          <table>
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Tournament</th>
+                <th>Team 1</th>
+                <th>Score</th>
+                <th>Team 2</th>
+                <th>Maps</th>
+              </tr>
+            </thead>
+            <tbody id="statsMatchesBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="subtab-awards" class="subtab-panel">
+        <div class="two-col">
+          <div class="card">
+            <div class="card-header"><h3 class="card-title">Tournament Champions Hall of Fame</h3></div>
+            <div class="table-wrap" style="max-height:68vh;">
+              <table>
+                <thead>
+                  <tr><th>Date</th><th>Tournament</th><th>Champion</th><th>Prize</th><th>Pts</th></tr>
+                </thead>
+                <tbody id="statsHofBody"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-header"><h3 class="card-title">Player MVPs, EVPs, Event Wins &amp; Top 20</h3></div>
+            <div class="table-wrap" style="max-height:68vh;">
+              <table>
+                <thead>
+                  <tr><th>Year/Mo</th><th>Award</th><th>Player</th><th>Team</th><th>Event</th></tr>
+                </thead>
+                <tbody id="statsAwardsBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="subtab-top20" class="subtab-panel">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title" id="top20Title">HLTV / CSTV Top 20 Prediction</h3>
+              <div class="muted" id="top20FormulaNote" style="font-size:12px;margin-top:3px;"></div>
+            </div>
+            <div class="top20-actions">
+              <span id="top20StatusPill" class="pill pill-blue">Base Projection</span>
+              <button id="btnTop20ApplySaveVote" class="btn btn-sm btn-blue" style="display:none;">Apply Save's Vote</button>
+              <button id="btnTop20ClearVote" class="btn btn-sm btn-ghost" style="display:none;">Clear Vote</button>
+            </div>
+          </div>
+          <div class="table-wrap" style="max-height:70vh;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Proj #</th>
+                  <th>Shift</th>
+                  <th>Base #</th>
+                  <th>Player</th>
+                  <th>Team</th>
+                  <th>vs Top 10 Rating</th>
+                  <th>Overall Rating</th>
+                  <th>vs Top 10 Matches</th>
+                  <th>Awards (Mult)</th>
+                  <th>Base Score</th>
+                  <th>Final Score</th>
+                  <th>CSTV Ballot</th>
+                  <th>Your Vote (+10%)</th>
+                </tr>
+              </thead>
+              <tbody id="statsTop20Body"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:14px;">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">High-Rated Snubs &amp; Gate Casualties</h3>
+              <div class="muted" style="font-size:12px;margin-top:3px;">Top-performing players (10+ matches) disqualified by having 0 MVPs/EVPs, 0 Top-10 opponent matches, or crushed by the &lt;50 Top-10 match sample penalty.</div>
+            </div>
+            <span id="top20SnubbedCount" class="muted">0</span>
+          </div>
+          <div class="table-wrap" style="max-height:42vh;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Player</th>
+                  <th>Team</th>
+                  <th>Overall Rating</th>
+                  <th>Overall Matches</th>
+                  <th>vs Top 10 Rating</th>
+                  <th>vs Top 10 Matches</th>
+                  <th>MVPs / EVPs</th>
+                  <th>Why Missed / Disqualified</th>
+                </tr>
+              </thead>
+              <tbody id="statsTop20SnubbedBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== BUG SHOWCASE TAB ==================== -->
+    <section id="tab-showcase" class="tab-panel">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <h2 class="card-title">Bug Showcase &amp; Save Anomaly Audit</h2>
+            <div class="muted" style="font-size:12px;">Live audit of the loaded save against CS2 pro baselines, tournament leaderboards, and AI roster/transfer decisions.</div>
+          </div>
+          <div class="inline-actions">
+            <input id="showcaseFilterQ" type="text" placeholder="Filter team / player / event..." style="width:220px;" />
+            <button id="btnCopyShowcaseMd" class="btn btn-sm">Copy Dev Report (.md)</button>
+            <button id="btnShowcaseRefresh" class="btn btn-primary btn-sm">Re-Scan Save</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="kpi-grid" id="showcaseKpiGrid"></div>
+
+      <div class="subtabs">
+        <button class="subtab-btn active" data-bsubtab="blowouts">Blowouts vs CS2 Pro Avg</button>
+        <button class="subtab-btn" data-bsubtab="awards">Undeserved MVPs &amp; EVPs</button>
+        <button class="subtab-btn" data-bsubtab="transfers">Unexplainable AI Transfers &amp; Benches</button>
+        <button class="subtab-btn" data-bsubtab="stability">We Don&apos;t Believe In Squad Stability</button>
+      </div>
+
+      <!-- Subtab: Blowouts -->
+      <div id="bsubtab-blowouts" class="bsubtab-panel active">
+        <div class="two-col">
+          <div class="card">
+            <div class="card-header">
+              <h3 class="card-title">Save vs CS2 Pro MR12 Benchmark</h3>
+              <span id="scBlowoutSummaryTag" class="badge"></span>
+            </div>
+            <div id="scBenchmarkBars"></div>
+          </div>
+          <div class="card">
+            <div class="card-header">
+              <h3 class="card-title">Intra-Half Win Streak Snowball (Rounds 2-12)</h3>
+              <span class="muted" style="font-size:12px;">Next-round win % by current streak</span>
+            </div>
+            <div id="scStreakBars"></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title">Engine Root Causes (<span class="mono">Assembly-CSharp.dll</span>)</h3>
+          </div>
+          <div class="bug-cause-grid" id="scBlowoutCauses"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title">Notable Blowouts &amp; Upsets <span class="muted" style="font-weight:400;font-size:12px;">(Click any match for round-by-round scoreboard)</span></h3>
+            <div class="inline-actions">
+              <select id="scBlowoutFilterMode" style="width:auto;">
+                <option value="all">All 13-&lt;=3 Blowouts</option>
+                <option value="13-0">13-0 Shutouts Only</option>
+                <option value="top20">Top 20 vs Top 20 (13-0)</option>
+                <option value="upset">Pre-Match Underdog (13-0)</option>
+              </select>
+              <span id="scBlowoutCount" class="muted">0</span>
+            </div>
+          </div>
+          <div class="table-wrap" style="max-height:62vh;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Event</th>
+                  <th>Map</th>
+                  <th>Matchup</th>
+                  <th>Score</th>
+                  <th>Win Odds</th>
+                  <th>Flags</th>
+                </tr>
+              </thead>
+              <tbody id="scBlowoutBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Subtab: Undeserved MVPs & EVPs -->
+      <div id="bsubtab-awards" class="bsubtab-panel">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">Flagged MVPs &amp; EVPs vs Actual Tournament Leaderboard</h3>
+              <div id="scAwardsNote" class="muted" style="font-size:12px;"></div>
+            </div>
+            <div class="inline-actions">
+              <select id="scAwardsFilterMode" style="width:auto;">
+                <option value="all">All Flagged Awards</option>
+                <option value="mvp">Outranked MVPs Only</option>
+                <option value="sub110">Sub-1.10 EVPs Only</option>
+                <option value="dup">Duplicate MVP+EVP Only</option>
+              </select>
+              <span id="scAwardsCount" class="muted">0</span>
+            </div>
+          </div>
+          <div class="table-wrap" style="max-height:70vh;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Role</th>
+                  <th>Date</th>
+                  <th>Event</th>
+                  <th>Awarded Player</th>
+                  <th>Stats (Rat / W-L / KPR / ADR)</th>
+                  <th>Event Rank</th>
+                  <th>Actual #1 at Event</th>
+                  <th>Why Undeserved</th>
+                </tr>
+              </thead>
+              <tbody id="scAwardsBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Subtab: Unexplainable AI Transfers -->
+      <div id="bsubtab-transfers" class="bsubtab-panel">
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title">Engine Root Causes (AI Roster &amp; Transfer Logic)</h3>
+          </div>
+          <div class="bug-cause-grid" id="scTransferCauses"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title">Current Bench Crimes <span class="muted" style="font-weight:400;font-size:12px;">(Teams benching higher-skilled players than an active starter)</span></h3>
+            <span id="scBenchCrimesCount" class="muted">0</span>
+          </div>
+          <div class="table-wrap" style="max-height:50vh;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Team</th>
+                  <th>Benched Star</th>
+                  <th>Benched Skill</th>
+                  <th>Starter Played Instead</th>
+                  <th>Starter Skill</th>
+                  <th>Skill Downgrade</th>
+                </tr>
+              </thead>
+              <tbody id="scBenchCrimesBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">&ldquo;Only National&rdquo; &amp; &ldquo;Only National Language&rdquo; Policy Violations</h3>
+              <div id="scPolicyNote" class="muted" style="font-size:12px;"></div>
+            </div>
+            <div class="inline-actions">
+              <select id="scPolicyFilterMode" style="width:auto;">
+                <option value="players">All Players (National + Language)</option>
+                <option value="hb0_players">'Only National' Players</option>
+                <option value="hb1_players">'Only National Language' Players</option>
+                <option value="paid_all">All Players + Paid Staff</option>
+                <option value="all">All (Including Free Staff)</option>
+              </select>
+              <span id="scPolicyCount" class="muted">0</span>
+            </div>
+          </div>
+          <div class="table-wrap" style="max-height:52vh;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Club (Club Nation · Policy)</th>
+                  <th>Role</th>
+                  <th>Hire (Nation)</th>
+                  <th>Policy / Languages</th>
+                  <th>Skill / Age</th>
+                  <th>Route &amp; Date</th>
+                  <th>Fee</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="scPolicyBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title">Unexplainable AI Transfer History</h3>
+            <span id="scTransfersCount" class="muted">0</span>
+          </div>
+          <div class="table-wrap" style="max-height:62vh;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Player (Skill / Age)</th>
+                  <th>Route</th>
+                  <th>Fee</th>
+                  <th>Better Option Ignored / Benched</th>
+                  <th>Why Unexplainable</th>
+                </tr>
+              </thead>
+              <tbody id="scTransfersBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Subtab: We Don't Believe In Squad Stability -->
+      <div id="bsubtab-stability" class="bsubtab-panel">
+        <div class="two-col">
+          <div class="card">
+            <div class="card-header">
+              <h3 class="card-title">Post-Transfer Stint vs CS2 Pro Low-End (6.0 Months)</h3>
+              <span id="scStabilitySummaryTag" class="badge"></span>
+            </div>
+            <div id="scStabilityBars"></div>
+          </div>
+          <div class="card">
+            <div class="card-header">
+              <h3 class="card-title">Why AI Orgs Have Zero Patience</h3>
+            </div>
+            <div class="bug-cause-grid" id="scStabilityCauses"></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">Short-Lived Signings &amp; Benched-On-Arrival Stints</h3>
+              <div id="scStintsNote" class="muted" style="font-size:12px;"></div>
+            </div>
+            <span id="scStintsCount" class="muted">0</span>
+          </div>
+          <div class="table-wrap" style="max-height:56vh;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Player</th>
+                  <th>Club</th>
+                  <th>Fee</th>
+                  <th>Signed &rarr; Last Match / Left</th>
+                  <th>Active Stint (vs 6.0m Pro Low End)</th>
+                  <th>Matches</th>
+                  <th>Outcome</th>
+                </tr>
+              </thead>
+              <tbody id="scStintsBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title">Most Revolving-Door Orgs (Roster Churn)</h3>
+            <span id="scChurnCount" class="muted">0</span>
+          </div>
+          <div class="table-wrap" style="max-height:56vh;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Club</th>
+                  <th>Player Moves (+In / -Out)</th>
+                  <th>Staff Hires</th>
+                  <th>Transfer Spend</th>
+                  <th>Active / Benched Now</th>
+                </tr>
+              </thead>
+              <tbody id="scChurnBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Validation Modal -->
+  <div class="modal-backdrop" id="validateModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3 style="margin:0;">Save Integrity &amp; Tactics Check</h3>
+        <button id="btnCloseValidateModal" class="btn btn-sm">Close</button>
+      </div>
+      <div class="modal-body" id="validateModalBody"></div>
+      <div class="modal-footer">
+        <button id="btnRunAutoFix" class="btn btn-primary">Auto-Fix All Issues &amp; Recalculate Tactics</button>
+        <button id="btnCancelValidate" class="btn">Dismiss</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Create New Player Modal -->
+  <div class="modal-backdrop" id="newPlayerModal">
+    <div class="modal" style="max-width:780px;">
+      <div class="modal-header">
+        <h3 style="margin:0;">Create New Player</h3>
+        <button id="btnCloseNewPlayerModal" class="btn btn-sm">Close</button>
+      </div>
+      <div class="modal-body">
+        <div class="subcard">
+          <div class="subcard-title">Player Details</div>
+          <div class="form-grid">
+            <div class="field"><label>Alias / Name *</label><input id="npName" type="text" placeholder="e.g. s1mple2" /></div>
+            <div class="field"><label>Age</label><input id="npAge" type="number" min="15" max="55" value="18" /></div>
+            <div class="field"><label>Nation</label><select id="npNation"></select></div>
+            <div class="field"><label>Reputation (1-20)</label><input id="npRep" type="number" min="1" max="20" value="12" /></div>
+            <div class="field"><label>Mentality</label><select id="npMentality"></select></div>
+            <div class="field"><label>Base Skill (1-20)</label><input id="npBaseSkill" type="number" min="1" max="20" step="0.5" value="14" /></div>
+            <div class="field"><label>Base Potential (1-20)</label><input id="npBasePot" type="number" min="1" max="20" step="1" value="18" /></div>
+            <div class="field"><label>Primary Language</label><select id="npLang"></select></div>
+          </div>
+          <div class="form-grid" style="margin-top:8px;">
+            <div class="field"><label>Role Preset</label>
+              <select id="npRolePreset">
+                <option value="balanced">Balanced (All 6/10)</option>
+                <option value="star_rifler">Star Entry / Rifler</option>
+                <option value="awper">Main AWPer / Sniper</option>
+                <option value="igl">IGL / Caller</option>
+                <option value="lurker">Lurker / Anchor</option>
+                <option value="support">Support / Utility</option>
+              </select>
+            </div>
+            <div class="field"><label>Desire to IGL (1-20)</label><input id="npDesireIgl" type="number" min="1" max="20" value="6" /></div>
+            <div class="field"><label>Desire to AWP (1-20)</label><input id="npDesireAwp" type="number" min="1" max="20" value="6" /></div>
+          </div>
+        </div>
+
+        <div class="subcard">
+          <div class="subcard-title">Team &amp; Contract (Optional)</div>
+          <div class="form-grid">
+            <div class="field"><label>Assign to Team</label><select id="npTeam"></select></div>
+            <div class="field"><label>Bench Existing Starter (if team selected)</label><select id="npBenchStarter"></select></div>
+            <div class="field"><label>Annual Salary ($)</label><input id="npSalary" type="number" step="1000" value="250000" /></div>
+            <div class="field"><label>End Date (ISO)</label><input id="npEndDate" type="text" value="2028-12-31T00:00:00" /></div>
+            <div class="field"><label>Squad Status</label><select id="npStatus"></select></div>
+            <div class="field"><label>IGL Role</label><select id="npIgl"></select></div>
+            <div class="field"><label>Sniper Role</label><select id="npSniper"></select></div>
+          </div>
+          <div class="checkbox-row" style="margin-top:6px;">
+            <input id="npJoinBenched" type="checkbox" />
+            <label for="npJoinBenched">Start on team's bench</label>
+          </div>
+        </div>
+        <p class="muted" style="margin:0;font-size:12px;">After creating, the player opens directly in the Player Editor so you can fine-tune any individual skill, language, role comfort, map opinion, or personality trait.</p>
+      </div>
+      <div class="modal-footer">
+        <button id="btnCancelNewPlayer" class="btn">Cancel</button>
+        <button id="btnCreatePlayerSubmit" class="btn btn-primary">Create Player</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Create New Staff Modal -->
+  <div class="modal-backdrop" id="newStaffModal">
+    <div class="modal" style="max-width:740px;">
+      <div class="modal-header">
+        <h3 style="margin:0;">Create New Staff Member</h3>
+        <button id="btnCloseNewStaffModal" class="btn btn-sm">Close</button>
+      </div>
+      <div class="modal-body">
+        <div class="subcard">
+          <div class="subcard-title">Staff Details</div>
+          <div class="form-grid">
+            <div class="field"><label>Name / Alias *</label><input id="nsName" type="text" placeholder="e.g. zonic2" /></div>
+            <div class="field"><label>Age</label><input id="nsAge" type="number" min="20" max="85" value="32" /></div>
+            <div class="field"><label>Nation</label><select id="nsNation"></select></div>
+            <div class="field"><label>Reputation (1-20)</label><input id="nsRep" type="number" min="1" max="20" value="14" /></div>
+            <div class="field"><label>Mentality</label><select id="nsMentality"></select></div>
+            <div class="field"><label>Base Skill (1-20)</label><input id="nsBaseSkill" type="number" min="1" max="20" step="0.5" value="15" /></div>
+            <div class="field"><label>Base Potential (1-20)</label><input id="nsBasePot" type="number" min="1" max="20" step="1" value="18" /></div>
+            <div class="field"><label>Primary Language</label><select id="nsLang"></select></div>
+          </div>
+        </div>
+
+        <div class="subcard">
+          <div class="subcard-title">Team &amp; Contract (Optional)</div>
+          <div class="form-grid">
+            <div class="field"><label>Assign to Team</label><select id="nsTeam"></select></div>
+            <div class="field"><label>Staff Role</label><select id="nsRole"></select></div>
+            <div class="field"><label>Annual Salary ($)</label><input id="nsSalary" type="number" step="1000" value="180000" /></div>
+            <div class="field"><label>End Date (ISO)</label><input id="nsEndDate" type="text" value="2028-12-31T00:00:00" /></div>
+          </div>
+          <div class="checkbox-row" style="margin-top:6px;">
+            <input id="nsReplaceExisting" type="checkbox" checked />
+            <label for="nsReplaceExisting">Release existing staff holding this role on the team</label>
+          </div>
+        </div>
+        <p class="muted" style="margin:0;font-size:12px;">After creating, the staff member opens directly in the Staff Editor for individual skill &amp; interest tweaks.</p>
+      </div>
+      <div class="modal-footer">
+        <button id="btnCancelNewStaff" class="btn">Cancel</button>
+        <button id="btnCreateStaffSubmit" class="btn btn-primary">Create Staff</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Player Deep Stats Modal -->
+  <div class="modal-backdrop" id="playerStatsModal">
+    <div class="modal modal-xl">
+      <div class="modal-header">
+        <h3 id="psModalTitle" style="margin:0;">Player Deep Stats</h3>
+        <button id="btnClosePsModal" class="btn btn-sm">Close</button>
+      </div>
+      <div class="modal-body" id="psModalBody"></div>
+    </div>
+  </div>
+
+  <!-- Team Deep Stats Modal -->
+  <div class="modal-backdrop" id="teamStatsModal">
+    <div class="modal modal-xl">
+      <div class="modal-header">
+        <h3 id="tsModalTitle" style="margin:0;">Team Deep Stats</h3>
+        <button id="btnCloseTsModal" class="btn btn-sm">Close</button>
+      </div>
+      <div class="modal-body" id="tsModalBody"></div>
+    </div>
+  </div>
+
+  <!-- Match Scoreboard Modal -->
+  <div class="modal-backdrop" id="matchStatsModal">
+    <div class="modal modal-xl">
+      <div class="modal-header">
+        <h3 id="msModalTitle" style="margin:0;">Match Scoreboard</h3>
+        <button id="btnCloseMsModal" class="btn btn-sm">Close</button>
+      </div>
+      <div class="modal-body" id="msModalBody"></div>
+    </div>
+  </div>
+
+  <div class="toast-stack" id="toastStack"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

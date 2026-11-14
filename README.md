@@ -21,6 +21,12 @@ Cross-platform web save editor for **CS Manager** (Windows, macOS, Linux/Steam D
   - **Map Pool Meta**: Map pick/ban veto rates, play counts, average rounds, overtime rate, total kills & aces.
   - **Match History & Match Box-Scores**: Full veto sequence (`Ban`/`Pick`/`Decider`), map-by-map CT/T & pistol stats, clutches, and dual-team box scores (`Rating` / `K` / `A (FA)` / `D` / `ADR` / `HS%` / `FK/FD` / `AWP` / `2K–5K`).
   - **Trophies & Awards**: Tournament Champions Hall of Fame, Career Player Awards (`MVP`, `EVP`, `Event Win`, `Top 20`), and Awards Timeline.
+  - **Top 20 Prediction**: Replicates the game's exact year-end formula (`AvgRating_vsTop10 * 1.05^MVP * 1.01^EVP * min(Matches_vsTop10 / 50, 1)`), CSTV Ballot `#1–#13` status, high-rated snubs watchlist, and live click-to-vote (`+10%`) rank shift simulator.
+- **Bug Showcase & Save Anomaly Audit**:
+  - **13-0s & Blowout Audit**: Compares save shutout (`13-0`) and blowout (`<=3` rounds) rates vs the CS2 Tier-1 pro baseline, complete with streak curves and clickable match scoreboards.
+  - **Undeserved MVPs & EVPs**: Evaluates real MVP/EVP tournaments against trophy-first and HLTV-style placement-gap rules.
+  - **AI Transfers & Policy Breaches**: Flags benching better starters, multi-team carousels, and breaches of `"Only National"` / `"Only National Language"` club hiring policies.
+  - **Squad Stability**: Tracks post-transfer stint lengths against the `6–14` month pro baseline and ranks high-churn orgs.
 - **Works Across All Devices**:
   - Auto-discovers `SavedGames` folders on Windows (`%USERPROFILE%\AppData\LocalLow\Crumana\CS Manager\SavedGames`), macOS (`~/Library/Application Support/Crumana/CS Manager/SavedGames`), and Linux / Steam Deck (native `~/.config/unity3d/...` + Steam Proton `compatdata`).
   - Supports native desktop Open/Save dialogs (`Browse File...` / `Save As...` / `Open Folder`) **and** browser file upload/download (`Upload .json` / `Download .json`), which also activate automatically on phones, tablets, or remote browsers.

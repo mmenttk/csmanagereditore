@@ -1,0 +1,14 @@
+# Save backups & personal saves (contains ~50MB JSON saves)
+backups/
+*.json
+
+# Python bytecode cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS & editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
