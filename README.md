@@ -46,5 +46,9 @@ chmod +x launch.sh
 ### Using from a Phone, Tablet, or Another Device on Your Wi-Fi / LAN
 Start the server with `--lan` (for example `launch.bat --lan` or `python3 server.py --lan`). The terminal will print a LAN URL (such as `http://192.168.1.42:8765/`) that any device on your network can open in its browser, then use **Upload .json** and **Download .json**.
 
+## virustotal result
+
+[virustotale]https://www.virustotal.com/gui/file/4ecf45066f021d64b82d79bc64cf731a25f6fbb172f9fe71fe43e18515f1d709?nocache=1
+
 ## Note Before Sharing With Others
 Keep your personal save files (e.g. `*.json`), `backups/`, and `__pycache__/` out of the zip when sharing this folder with other people—only `server.py`, `save_engine.py`, `gamedata.py`, `launch.bat`, `launch.sh`, `README.md`, and the `static/` folder are needed.
