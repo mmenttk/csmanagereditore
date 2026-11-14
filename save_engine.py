@@ -1,0 +1,4130 @@
+"""Core save loading, saving, validation, AI tactics rebuilding, and transfer logic."""
+
+from __future__ import annotations
+
+import copy
+import datetime as dt
+import json
+import os
+import random
+import shutil
+import sys
+from pathlib import Path
+from typing import Any
+
+from gamedata import (
+    LANGUAGES,
+    MAP_POS_TO_PLAYER_ATTR,
+    MAP_TACTIC_POSITIONS,
+    NATIONS,
+    PLAYER_POSITIONS,
+    PLAYER_SKILLS,
+    STAFF_ROLES,
+    STAFF_SKILLS,
+)
+
+EDITOR_DIR = Path(__file__).resolve().parent
+BACKUPS_DIR = EDITOR_DIR / "backups"
+
+
+def discover_save_dirs() -> list[tuple[str, Path]]:
+    """Return candidate CS Manager SavedGames folders across Windows, macOS, and Linux/Proton."""
+    home = Path.home()
+    candidates: list[tuple[str, Path]] = []
+
+    if os.name == "nt":
+        user_profile = Path(os.environ.get("USERPROFILE", str(home)))
+        candidates.append(("SavedGames", user_profile / "AppData" / "LocalLow" / "Crumana" / "CS Manager" / "SavedGames"))
+        if user_profile != home:
+            candidates.append(("SavedGames", home / "AppData" / "LocalLow" / "Crumana" / "CS Manager" / "SavedGames"))
+    elif sys.platform == "darwin":
+        app_sup = home / "Library" / "Application Support"
+        candidates.append(("SavedGames", app_sup / "Crumana" / "CS Manager" / "SavedGames"))
+        candidates.append(("SavedGames", app_sup / "unity.Crumana.CS Manager" / "SavedGames"))
+    else:
+        candidates.append(("SavedGames", home / ".config" / "unity3d" / "Crumana" / "CS Manager" / "SavedGames"))
+        for steam_root in (
+            home / ".steam" / "steam" / "steamapps" / "compatdata",
+            home / ".local" / "share" / "Steam" / "steamapps" / "compatdata",
+            home / ".var" / "app" / "com.valvesoftware.Steam" / ".local" / "share" / "Steam" / "steamapps" / "compatdata",
+        ):
+            if steam_root.exists():
+                for pfx_sg in steam_root.glob("*/pfx/drive_c/users/steamuser/AppData/LocalLow/Crumana/CS Manager/SavedGames"):
+                    candidates.append(("Steam Proton SavedGames", pfx_sg))
+
+    candidates.append(("Editor Folder", EDITOR_DIR))
+    return candidates
+
+
+def get_default_saves_dir() -> Path:
+    for source, folder in discover_save_dirs():
+        if source != "Editor Folder" and folder.exists():
+            return folder
+    return discover_save_dirs()[0][1]
+
+
+DEFAULT_SAVES_DIR = get_default_saves_dir()
+
+
+def discover_save_files() -> list[dict[str, Any]]:
+    """Return available .json save files from CS Manager's SavedGames and the editor folder."""
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for source, folder in discover_save_dirs():
+        if not folder.exists():
+            continue
+        for p in sorted(folder.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
+            resolved = str(p.resolve())
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            stat = p.stat()
+            results.append(
+                {
+                    "name": p.name,
+                    "source": source,
+                    "path": resolved,
+                    "size_mb": round(stat.st_size / (1024 * 1024), 2),
+                    "modified": dt.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+                }
+            )
+    return results
+
+
+def _clamp(val: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, val))
+
+
+def _wants_role(desire: int, role_status: int) -> bool:
+    if role_status == 0:
+        return desire >= 15
+    if role_status == 1:
+        return 6 < desire < 15
+    if role_status == 2:
+        return desire <= 6
+    return False
+
+
+def _role_comfort_norm(role_comfort: float) -> float:
+    # Matches MapPositionAttribute::GetRoleComfortNormalized: Lerp(0, 1, (comfort - 1) / 8) -> wait:
+    # IL: Mathf.Lerp(0, 1, roleComfort / 9) or (roleComfort-1)/9; clamping [0, 1].
+    return _clamp((float(role_comfort) - 1.0) / 9.0, 0.0, 1.0)
+
+
+def _lane_protection_score(pos_type: int, lane: int) -> float:
+    # Matches MapPosition::GetLaneProtectionScore(lane): 0=A, 1=B, 2=Mid
+    if lane == 0:  # A
+        if pos_type == 5:
+            return 3.0
+        if pos_type == 6:
+            return 2.0
+        if pos_type in (9, 10):
+            return 0.5
+        return 0.0
+    if lane == 2:  # Mid
+        if pos_type == 9:
+            return 4.0
+        if pos_type in (6, 8, 10):
+            return 2.0
+        return 0.0
+    if lane == 1:  # B
+        if pos_type == 7:
+            return 3.0
+        if pos_type == 8:
+            return 2.0
+        if pos_type == 10:
+            return 0.5
+        return 0.0
+    return 0.0
+
+
+def _player_avg_skill(player: dict[str, Any]) -> float:
+    skills = player.get("skills", {})
+    if not skills:
+        return 0.0
+    return round(sum(skills.values()) / len(skills), 2)
+
+
+def _staff_avg_skill(staff: dict[str, Any]) -> float:
+    skills = staff.get("skills", {})
+    if not skills:
+        return 0.0
+    return round(sum(skills.values()) / len(skills), 2)
+
+
+class SaveSession:
+    """In-memory representation of a loaded CS Manager save file."""
+
+    def __init__(self) -> None:
+        self.path: Path | None = None
+        self.virtual_name: str = ""
+        self.data: dict[str, Any] | None = None
+        self.dirty: bool = False
+        self.players_by_id: dict[int, dict[str, Any]] = {}
+        self.staff_by_id: dict[int, dict[str, Any]] = {}
+        self.teams_by_id: dict[int, dict[str, Any]] = {}
+        self.maps_by_id: dict[int, dict[str, Any]] = {}
+        self.player_contract_by_pid: dict[int, dict[str, Any]] = {}
+        self.staff_contract_by_sid: dict[int, dict[str, Any]] = {}
+
+    def _validate_loaded_root(self, data: Any) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            raise ValueError("Invalid CS Manager save file (root JSON must be an object).")
+        for req_key in ("players", "playerContracts", "teams", "staffers", "staffContracts"):
+            if req_key not in data:
+                raise ValueError(f"Invalid CS Manager save file (missing '{req_key}').")
+        return data
+
+    def load(self, file_path: str | Path) -> dict[str, Any]:
+        p = Path(file_path).resolve()
+        if not p.exists():
+            raise FileNotFoundError(f"Save file not found: {p}")
+        with p.open("r", encoding="utf-8") as f:
+            data = self._validate_loaded_root(json.load(f))
+        self.path = p
+        self.virtual_name = p.name
+        self.data = data
+        self.dirty = False
+        self.rebuild_indices()
+        return self.summary()
+
+    def load_upload(self, filename: str, raw_text: str) -> dict[str, Any]:
+        """Load a save file uploaded via browser from any device."""
+        clean_name = Path(filename or "uploaded_save.json").name
+        if not clean_name.lower().endswith(".json"):
+            clean_name += ".json"
+        data = self._validate_loaded_root(json.loads(raw_text))
+        self.path = None
+        self.virtual_name = clean_name
+        self.data = data
+        self.dirty = False
+        self.rebuild_indices()
+        return self.summary()
+
+    def export_json_bytes(self) -> tuple[str, bytes]:
+        """Serialize the current save into Unity-compact JSON bytes for browser download."""
+        if self.data is None:
+            raise RuntimeError("No save file is currently loaded.")
+        filename = self.path.name if self.path else (self.virtual_name or "cs_manager_save.json")
+        raw = json.dumps(self.data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        return filename, raw
+
+    def rebuild_indices(self) -> None:
+        assert self.data is not None
+        self.players_by_id = {p["id"]: p for p in self.data["players"]["players"]}
+        self.staff_by_id = {s["id"]: s for s in self.data["staffers"]["staffers"]}
+        self.teams_by_id = {t["id"]: t for t in self.data["teams"]["teams"]}
+        self.maps_by_id = {m["id"]: m for m in self.data.get("maps", {}).get("maps", [])}
+        self.player_contract_by_pid = {}
+        for c in self.data["playerContracts"]["playerContracts"]:
+            self.player_contract_by_pid[c["playerId"]] = c
+        self.staff_contract_by_sid = {}
+        for c in self.data["staffContracts"]["staffContracts"]:
+            self.staff_contract_by_sid[c["staffId"]] = c
+
+    def save(self, target_path: str | Path | None = None) -> dict[str, Any]:
+        if self.data is None:
+            raise RuntimeError("No save file is currently loaded.")
+        if target_path is None and self.path is None:
+            raise ValueError("Uploaded browser save has no local file path yet — use 'Save As...' or 'Download .json'.")
+        dest = Path(target_path).resolve() if target_path else self.path
+        assert dest is not None
+        backup_path: str | None = None
+        if dest.exists():
+            BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
+            stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            bpath = BACKUPS_DIR / f"{dest.stem}_{stamp}{dest.suffix}"
+            shutil.copy2(dest, bpath)
+            backup_path = str(bpath)
+
+        tmp_path = dest.with_suffix(".json.tmp")
+        with tmp_path.open("w", encoding="utf-8") as f:
+            # Match UnityEngine.JsonUtility.ToJson(..., false) compact formatting
+            json.dump(self.data, f, separators=(",", ":"), ensure_ascii=False)
+        tmp_path.replace(dest)
+        self.path = dest
+        self.virtual_name = dest.name
+        self.dirty = False
+        return {
+            "saved_path": str(dest),
+            "backup_path": backup_path,
+            "summary": self.summary(),
+        }
+
+    def summary(self) -> dict[str, Any]:
+        if self.data is None:
+            return {"path": "", "filename": "", "dirty": False, "counts": {}, "maps": []}
+        profile = self.data.get("profile", {})
+        user_team_id = profile.get("team", 0)
+        user_team = self.teams_by_id.get(user_team_id)
+        fname = self.path.name if self.path else (self.virtual_name or "uploaded_save.json")
+        return {
+            "path": str(self.path) if self.path else f"browser://{fname}",
+            "isBrowserUpload": self.path is None,
+            "filename": fname,
+            "dirty": self.dirty,
+            "gameVersion": self.data.get("gameVersion", ""),
+            "datetime": self.data.get("datetime", {}),
+            "managerName": profile.get("name", ""),
+            "userTeamId": user_team_id,
+            "userTeamName": user_team["name"] if user_team else "Unemployed",
+            "counts": {
+                "players": len(self.players_by_id),
+                "staffers": len(self.staff_by_id),
+                "teams": len(self.teams_by_id),
+                "playerContracts": len(self.data["playerContracts"]["playerContracts"]),
+                "staffContracts": len(self.data["staffContracts"]["staffContracts"]),
+                "transferHistories": len(self.data.get("transferHistories", {}).get("transferHistories", [])),
+            },
+            "maps": [
+                {"id": m["id"], "name": m["name"], "active": bool(m.get("active", True))}
+                for m in self.data.get("maps", {}).get("maps", [])
+            ],
+        }
+
+    # ------------------------------------------------------------------
+    # Team Roster & AI Tactics Helpers (faithful to Assembly-CSharp.dll)
+    # ------------------------------------------------------------------
+
+    def get_team_player_contracts(self, team_id: int) -> list[dict[str, Any]]:
+        assert self.data is not None
+        return [c for c in self.data["playerContracts"]["playerContracts"] if c.get("teamId") == team_id]
+
+    def get_team_staff_contracts(self, team_id: int) -> list[dict[str, Any]]:
+        assert self.data is not None
+        return [c for c in self.data["staffContracts"]["staffContracts"] if c.get("teamId") == team_id]
+
+    def remove_player_from_tactics(self, team: dict[str, Any], player_id: int) -> None:
+        """Matches Team::RemovePlayerFromTactics across all generalTactics and mapTactics."""
+        for gt in team.get("generalTactics", []):
+            for field in ("iglId", "secondIglId", "sniperId", "secondSniperId"):
+                if gt.get(field) == player_id:
+                    gt[field] = 0
+        for mt in team.get("mapTactics", []):
+            mt["mapPositions"] = [
+                mp for mp in mt.get("mapPositions", []) if mp.get("roleOccupantId") != player_id
+            ]
+
+    def _pick_igl_roles(self, active_pairs: list[tuple[dict[str, Any], dict[str, Any]]]) -> tuple[int, int]:
+        if not active_pairs:
+            return 0, 0
+        status_bonus = {0: 30.0, 1: 20.0, 2: 10.0, 3: 0.0}
+
+        def score_primary(p: dict[str, Any], c: dict[str, Any]) -> float:
+            desire = p.get("personality", {}).get("desireToIgl", 10)
+            s = 100.0 if c.get("igl") == 0 else (30.0 if c.get("igl") == 1 else 0.0)
+            if _wants_role(desire, 0):
+                s += status_bonus.get(c.get("status", 3), 0.0)
+            s += desire + p.get("skills", {}).get("leadership", 0.0) * 0.5
+            return s
+
+        primary_p, _ = max(active_pairs, key=lambda pc: score_primary(*pc))
+        primary_id = primary_p["id"]
+
+        others = [pc for pc in active_pairs if pc[0]["id"] != primary_id]
+        if not others:
+            return primary_id, 0
+
+        def score_secondary(p: dict[str, Any], c: dict[str, Any]) -> float:
+            desire = p.get("personality", {}).get("desireToIgl", 10)
+            s = 100.0 if c.get("igl") == 1 else 15.0
+            if _wants_role(desire, 1):
+                s += status_bonus.get(c.get("status", 3), 0.0)
+            s += desire * 0.5 + p.get("skills", {}).get("leadership", 0.0) * 0.25
+            return s
+
+        sec_p, _ = max(others, key=lambda pc: score_secondary(*pc))
+        return primary_id, sec_p["id"]
+
+    def _pick_sniper_roles(self, active_pairs: list[tuple[dict[str, Any], dict[str, Any]]]) -> tuple[int, int]:
+        if not active_pairs:
+            return 0, 0
+        status_bonus = {0: 30.0, 1: 20.0, 2: 10.0, 3: 0.0}
+
+        def score_primary(p: dict[str, Any], c: dict[str, Any]) -> float:
+            desire = p.get("personality", {}).get("desireToAwp", 10)
+            s = 100.0 if c.get("sniper") == 0 else (30.0 if c.get("sniper") == 1 else 0.0)
+            if _wants_role(desire, 0):
+                s += status_bonus.get(c.get("status", 3), 0.0)
+            s += desire + p.get("skills", {}).get("snipers", 0.0) * 0.5
+            return s
+
+        primary_p, primary_c = max(active_pairs, key=lambda pc: score_primary(*pc))
+        primary_id = primary_p["id"] if (primary_c.get("sniper") in (0, 1) or primary_p.get("skills", {}).get("snipers", 0) >= 12) else primary_p["id"]
+
+        others = [pc for pc in active_pairs if pc[0]["id"] != primary_id]
+        if not others:
+            return primary_id, 0
+
+        def score_secondary(p: dict[str, Any], c: dict[str, Any]) -> float:
+            desire = p.get("personality", {}).get("desireToAwp", 10)
+            s = 100.0 if c.get("sniper") == 1 else 15.0
+            if _wants_role(desire, 1):
+                s += status_bonus.get(c.get("status", 3), 0.0)
+            s += desire * 0.5 + p.get("skills", {}).get("snipers", 0.0) * 0.25
+            return s
+
+        sec_p, sec_c = max(others, key=lambda pc: score_secondary(*pc))
+        sec_id = sec_p["id"] if (sec_c.get("sniper") == 1 or sec_p.get("skills", {}).get("snipers", 0) >= 11) else 0
+        return primary_id, sec_id
+
+    def recalculate_ai_tactics(self, team_id: int) -> dict[str, Any]:
+        """Rebuild generalTactics & mapTactics for team_id using CS Manager's AI tactics rules."""
+        assert self.data is not None
+        team = self.teams_by_id.get(team_id)
+        if not team:
+            raise ValueError(f"Team {team_id} not found.")
+
+        active_contracts = [c for c in self.get_team_player_contracts(team_id) if not c.get("benched", False)]
+        active_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for c in active_contracts:
+            p = self.players_by_id.get(c["playerId"])
+            if p:
+                active_pairs.append((p, c))
+
+        # 1. General Tactics
+        igl_id, sec_igl_id = self._pick_igl_roles(active_pairs)
+        sniper_id, sec_sniper_id = self._pick_sniper_roles(active_pairs)
+
+        head_coach = None
+        for sc in self.get_team_staff_contracts(team_id):
+            if sc.get("role") == 0:
+                head_coach = self.staff_by_id.get(sc["staffId"])
+                break
+
+        igl_player = self.players_by_id.get(igl_id)
+        coach_m = head_coach.get("preferredMentality", 1) if head_coach else None
+        igl_m = igl_player.get("preferredMentality", 1) if igl_player else None
+        if coach_m in (0, 1, 2) and igl_m in (0, 1, 2):
+            if (coach_m == 2 and igl_m == 0) or (coach_m == 0 and igl_m == 2):
+                mentality = 1
+            else:
+                mentality = igl_m
+        elif igl_m in (0, 1, 2):
+            mentality = igl_m
+        elif coach_m in (0, 1, 2):
+            mentality = coach_m
+        else:
+            mentality = 1
+
+        if mentality == 2:
+            lo, hi = 0.4, 1.0
+        elif mentality == 1:
+            lo, hi = 0.3, 0.7
+        else:
+            lo, hi = 0.0, 0.6
+
+        gen_list = team.setdefault("generalTactics", [])
+        active_gt = next((g for g in gen_list if g.get("active")), None)
+        if active_gt is None:
+            if gen_list:
+                active_gt = gen_list[0]
+                active_gt["active"] = True
+            else:
+                active_gt = {
+                    "iglId": 0,
+                    "secondIglId": 0,
+                    "sniperId": 0,
+                    "secondSniperId": 0,
+                    "attackPace": round(random.uniform(lo, hi), 4),
+                    "attackPack": round(random.uniform(lo, hi), 4),
+                    "attackForceBuy": round(random.uniform(lo, hi), 4),
+                    "defenseForceBuy": round(random.uniform(lo, hi), 4),
+                    "defenseStack": round(random.uniform(lo, hi), 4),
+                    "defensePush": round(random.uniform(lo, hi), 4),
+                    "defenseUtilityUsageTiming": 0.0,
+                    "active": True,
+                    "knowledge": 20.0,
+                }
+                gen_list.append(active_gt)
+
+        active_gt["iglId"] = igl_id
+        active_gt["secondIglId"] = sec_igl_id
+        active_gt["sniperId"] = sniper_id
+        active_gt["secondSniperId"] = sec_sniper_id
+
+        # Also sanitize any inactive generalTactic presets so no stale departed player IDs linger
+        active_id_set = {p["id"] for p, _ in active_pairs}
+        for gt in gen_list:
+            if not gt.get("active"):
+                for f in ("iglId", "secondIglId", "sniperId", "secondSniperId"):
+                    if gt.get(f, 0) not in active_id_set:
+                        gt[f] = 0
+
+        # 2. Map Tactics (rebuild active mapTactic for every map in save)
+        status_weight = {0: 10.0, 1: 6.0, 2: 3.5, 3: 1.0}
+        maps_list = self.data.get("maps", {}).get("maps", [])
+        existing_by_map = {mt["mapId"]: mt for mt in team.get("mapTactics", [])}
+        new_map_tactics: list[dict[str, Any]] = []
+
+        for m in maps_list:
+            mid = m["id"]
+            old_mt = existing_by_map.get(mid, {})
+            map_positions: list[dict[str, Any]] = []
+
+            if active_pairs:
+                # Defense positions: 5..10, Attack positions: 0..4
+                lane_diff = {
+                    0: float(m.get("aLaneDefendDifficulty", 5.0)),
+                    1: float(m.get("bLaneDefendDifficulty", 5.0)),
+                    2: float(m.get("midLaneDefendDifficulty", 5.0)),
+                }
+
+                for side in (0, 1):  # 0 = defense (5..10), 1 = attack (0..4)
+                    pos_range = list(range(5, 11)) if side == 0 else list(range(0, 5))
+                    # Build candidate position pool up to len(active_pairs)
+                    pool: list[tuple[int, float]] = []
+                    cur_lanes = dict(lane_diff)
+                    while len(pool) < len(active_pairs):
+                        if side == 0:
+                            best_pos = None
+                            best_lane_score = -1e9
+                            used_pos = {p_id for p_id, _ in pool}
+                            for pt in pos_range:
+                                sc = 0.0
+                                for ln in (0, 1, 2):
+                                    sc += _lane_protection_score(pt, ln) * abs(cur_lanes[ln]) / 10.0
+                                if pt in used_pos:
+                                    sc -= 0.3
+                                if sc > best_lane_score:
+                                    best_lane_score = sc
+                                    best_pos = pt
+                            assert best_pos is not None
+                            pool.append((best_pos, max(best_lane_score, 0.5)))
+                            for ln in (0, 1, 2):
+                                cur_lanes[ln] -= _lane_protection_score(best_pos, ln)
+                        else:
+                            for pt in pos_range:
+                                if len(pool) < len(active_pairs):
+                                    pool.append((pt, 3.0))
+
+                    remaining_players = list(active_pairs)
+                    remaining_pool = list(pool)
+                    max_pool_score = max((s for _, s in remaining_pool), default=1.0) or 1.0
+                    used_pos_counts: dict[int, int] = {}
+
+                    while remaining_players:
+                        best_pair = None
+                        best_pos_type = pos_range[0]
+                        best_total = -1e9
+                        for p, c in remaining_players:
+                            attr_by_type = {a["positionType"]: a["roleComfort"] for a in p.get("mapPositionAttributes", [])}
+                            st_w = status_weight.get(c.get("status", 3), 1.0)
+                            for pt in pos_range:
+                                attr_type = MAP_POS_TO_PLAYER_ATTR[pt]
+                                comfort = _role_comfort_norm(attr_by_type.get(attr_type, 5))
+                                matching_pool = sorted([s for ppt, s in remaining_pool if ppt == pt], reverse=True)
+                                if matching_pool:
+                                    team_want = matching_pool[0] / max_pool_score
+                                else:
+                                    team_want = -1.0 * (len(remaining_players) / max(len(active_pairs), 1))
+                                total = comfort * 0.8 * st_w + team_want * 2.0 + random.uniform(0.0, 0.05)
+                                if total > best_total:
+                                    best_total = total
+                                    best_pair = (p, c)
+                                    best_pos_type = pt
+                        assert best_pair is not None
+                        chosen_p, _ = best_pair
+                        ui_pos = used_pos_counts.get(best_pos_type, 0) + 1
+                        used_pos_counts[best_pos_type] = ui_pos
+                        map_positions.append(
+                            {
+                                "positionType": best_pos_type,
+                                "roleOccupantId": chosen_p["id"],
+                                "uiPosition": ui_pos,
+                                "individualInstructionUtilityUsage": 0,
+                                "individualInstructionUtilityPriority": 0,
+                            }
+                        )
+                        remaining_players.remove(best_pair)
+                        for idx, (ppt, _) in enumerate(remaining_pool):
+                            if ppt == best_pos_type:
+                                remaining_pool.pop(idx)
+                                break
+
+            new_map_tactics.append(
+                {
+                    "mapId": mid,
+                    "equilibriumFromTraining": old_mt.get("equilibriumFromTraining", 0),
+                    "knowledgeFromTraining": old_mt.get("knowledgeFromTraining", 15),
+                    "knowledgeFromPlayers": old_mt.get("knowledgeFromPlayers", 25),
+                    "mapPositions": map_positions,
+                    "active": True,
+                    "aFocus": old_mt.get("aFocus", False),
+                    "midFocus": old_mt.get("midFocus", False),
+                    "bFocus": old_mt.get("bFocus", False),
+                }
+            )
+
+        # Keep any inactive tactics sanitized, replace active ones
+        inactive_mts = [mt for mt in team.get("mapTactics", []) if not mt.get("active")]
+        for mt in inactive_mts:
+            mt["mapPositions"] = [
+                mp for mp in mt.get("mapPositions", []) if mp.get("roleOccupantId") in active_id_set
+            ]
+        team["mapTactics"] = new_map_tactics + inactive_mts
+        self.dirty = True
+        return {
+            "teamId": team_id,
+            "activePlayerIds": sorted(active_id_set),
+            "iglId": igl_id,
+            "secondIglId": sec_igl_id,
+            "sniperId": sniper_id,
+            "secondSniperId": sec_sniper_id,
+            "mapsUpdated": len(new_map_tactics),
+        }
+
+    # ------------------------------------------------------------------
+    # Bench / Promote & Transfer Operations
+    # ------------------------------------------------------------------
+
+    def set_player_benched(self, player_id: int, benched: bool, auto_tactics: bool = True) -> dict[str, Any]:
+        c = self.player_contract_by_pid.get(player_id)
+        if not c:
+            raise ValueError(f"Player {player_id} does not have an active contract.")
+        c["benched"] = bool(benched)
+        team_id = c["teamId"]
+        team = self.teams_by_id.get(team_id)
+        if team and benched:
+            self.remove_player_from_tactics(team, player_id)
+        tactics_res = None
+        if team and auto_tactics:
+            tactics_res = self.recalculate_ai_tactics(team_id)
+        self.dirty = True
+        return {"playerId": player_id, "teamId": team_id, "benched": bool(benched), "tactics": tactics_res}
+
+    def transfer_player(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Execute a complete, game-consistent player transfer."""
+        assert self.data is not None
+        player_id = int(payload["playerId"])
+        target_team_id = int(payload["targetTeamId"])  # 0 = release to Free Agency
+        bench_player_id = int(payload.get("benchPlayerId") or 0)
+        join_benched = bool(payload.get("joinBenched", False))
+        auto_promote_old = bool(payload.get("autoPromoteOldTeam", True))
+        buyout_price = int(payload.get("buyoutPrice") or 0)
+        apply_finances = bool(payload.get("applyFinances", False))
+
+        player = self.players_by_id.get(player_id)
+        if not player:
+            raise ValueError(f"Player {player_id} not found.")
+        if target_team_id != 0 and target_team_id not in self.teams_by_id:
+            raise ValueError(f"Target team {target_team_id} not found.")
+
+        old_contract = self.player_contract_by_pid.get(player_id)
+        old_team_id = old_contract["teamId"] if old_contract else 0
+        profile = self.data.get("profile", {})
+        user_team_id = profile.get("team", 0)
+
+        # 1. Remove player from academy if needed
+        if player.get("academyPlayer"):
+            player["academyPlayer"] = False
+            for t in self.data["teams"]["teams"]:
+                if player_id in t.get("academyPlayers", []):
+                    t["academyPlayers"] = [x for x in t["academyPlayers"] if x != player_id]
+
+        # 2. Clean up old team if leaving a different team
+        old_team_updated = None
+        if old_team_id and old_team_id != target_team_id:
+            old_team = self.teams_by_id.get(old_team_id)
+            if old_team:
+                old_team["playerDilemmas"] = [
+                    d for d in old_team.get("playerDilemmas", []) if d.get("playerId") != player_id
+                ]
+                if "playersToBenchAfterMatch" in old_team:
+                    old_team["playersToBenchAfterMatch"] = [
+                        x for x in old_team["playersToBenchAfterMatch"] if x != player_id
+                    ]
+                if old_team_id == user_team_id:
+                    for em in self.data.get("emails", {}).get("emails", []):
+                        if em.get("player1Id") == player_id or em.get("player2Id") == player_id:
+                            em["mustRespond"] = False
+                self.remove_player_from_tactics(old_team, player_id)
+
+        # Remove any existing contract(s) for this player
+        self.data["playerContracts"]["playerContracts"] = [
+            c for c in self.data["playerContracts"]["playerContracts"] if c.get("playerId") != player_id
+        ]
+
+        # If old team dropped below 5 active players and has a benched player, optionally promote
+        if old_team_id and old_team_id != target_team_id:
+            old_team = self.teams_by_id.get(old_team_id)
+            if old_team:
+                rem_contracts = self.get_team_player_contracts(old_team_id)
+                rem_active = [c for c in rem_contracts if not c.get("benched")]
+                rem_benched = [c for c in rem_contracts if c.get("benched")]
+                if auto_promote_old and len(rem_active) < 5 and rem_benched:
+                    rem_benched.sort(
+                        key=lambda c: _player_avg_skill(self.players_by_id.get(c["playerId"], {})),
+                        reverse=True,
+                    )
+                    rem_benched[0]["benched"] = False
+                old_team_updated = self.recalculate_ai_tactics(old_team_id)
+
+        # 3. Release to free agency if target_team_id == 0
+        if target_team_id == 0:
+            player["monthsBenchedOrWithoutContract"] = 0
+            player["monthsSinceNewContract"] = 6
+            self.rebuild_indices()
+            self.dirty = True
+            return {
+                "status": "released",
+                "playerId": player_id,
+                "fromTeamId": old_team_id,
+                "targetTeamId": 0,
+                "oldTeamTactics": old_team_updated,
+            }
+
+        target_team = self.teams_by_id[target_team_id]
+
+        # 4. If user selected an active player to bench on target team, bench them first
+        if bench_player_id and bench_player_id != player_id:
+            for c in self.data["playerContracts"]["playerContracts"]:
+                if c.get("teamId") == target_team_id and c.get("playerId") == bench_player_id:
+                    c["benched"] = True
+                    self.remove_player_from_tactics(target_team, bench_player_id)
+                    break
+
+        # 5. Create new contract
+        cur_dt = self.data.get("datetime", {"hour": 0, "day": 1, "month": 7, "year": 2026})
+        default_end = {
+            "hour": 0,
+            "day": 1,
+            "month": 7,
+            "year": int(cur_dt.get("year", 2026)) + 2,
+        }
+        end_date = payload.get("endDate") or (old_contract.get("endDate") if old_contract else None) or default_end
+        new_contract = {
+            "salaryYear": int(payload.get("salaryYear") if payload.get("salaryYear") is not None else (old_contract.get("salaryYear", 250000) if old_contract else 250000)),
+            "endDate": {
+                "hour": int(end_date.get("hour", 0)),
+                "day": int(end_date.get("day", 1)),
+                "month": int(end_date.get("month", 7)),
+                "year": int(end_date.get("year", int(cur_dt.get("year", 2026)) + 2)),
+            },
+            "teamId": target_team_id,
+            "playerId": player_id,
+            "status": int(payload.get("status", old_contract.get("status", 1) if old_contract else 1)),
+            "sniper": int(payload.get("sniper", old_contract.get("sniper", 2) if old_contract else 2)),
+            "igl": int(payload.get("igl", old_contract.get("igl", 2) if old_contract else 2)),
+            "benched": bool(join_benched),
+            "signingOnFee": int(payload.get("signingOnFee", 0)),
+            "transferStatus": int(payload.get("transferStatus", 0)),
+            "askingPrice": int(payload.get("askingPrice", 0)),
+            "contractType": int(payload.get("contractType", 0)),
+        }
+        self.data["playerContracts"]["playerContracts"].append(new_contract)
+
+        # 6. Update player state & clean interests/shortlist/mood (matches SignPlayer)
+        player["monthsBenchedOrWithoutContract"] = 0
+        player["monthsSinceNewContract"] = 0
+        mood = player.setdefault("mood", {})
+        mood["moodFromDialog"] = 0.0
+        mood["moodFromTournamentReputation"] = 0.0
+        mood["moodsFromMatches"] = []
+
+        for t in self.data["teams"]["teams"]:
+            if "personInterests" in t:
+                t["personInterests"] = [
+                    pi for pi in t["personInterests"] if pi.get("playerId") != player_id
+                ]
+        if "playerShortlist" in profile:
+            profile["playerShortlist"] = [x for x in profile["playerShortlist"] if x != player_id]
+
+        # Adjust team cohesion training & clear cached mainLanguage
+        cohesion = target_team.setdefault("teamCohesion", {})
+        if "cohesionFromTraining" in cohesion:
+            cohesion["cohesionFromTraining"] = min(float(cohesion["cohesionFromTraining"]), 0.3)
+
+        # 7. Log TransferHistory
+        if old_team_id != target_team_id:
+            th_list = self.data.setdefault("transferHistories", {}).setdefault("transferHistories", [])
+            th_list.append(
+                {
+                    "personId": player_id,
+                    "personType": 0,
+                    "transferType": 0,
+                    "datetime": copy.deepcopy(cur_dt),
+                    "purchasePrice": buyout_price,
+                    "fromTeamId": old_team_id,
+                    "otherTeamId": target_team_id,
+                }
+            )
+
+        # 8. Optional buyout finances
+        if apply_finances and buyout_price > 0 and old_team_id != target_team_id:
+            tf_new = target_team.setdefault("teamFinances", {})
+            tf_new["currentBalance"] = int(tf_new.get("currentBalance", 0)) - buyout_price
+            tf_new["buyoutAndSignOnExpenses"] = int(tf_new.get("buyoutAndSignOnExpenses", 0)) + buyout_price
+            if old_team_id and old_team_id in self.teams_by_id:
+                tf_old = self.teams_by_id[old_team_id].setdefault("teamFinances", {})
+                tf_old["currentBalance"] = int(tf_old.get("currentBalance", 0)) + buyout_price
+                tf_old["buyoutIncome"] = int(tf_old.get("buyoutIncome", 0)) + buyout_price
+
+        self.rebuild_indices()
+        new_team_tactics = self.recalculate_ai_tactics(target_team_id)
+        self.dirty = True
+
+        return {
+            "status": "transferred",
+            "playerId": player_id,
+            "fromTeamId": old_team_id,
+            "targetTeamId": target_team_id,
+            "benchedPlayerId": bench_player_id or None,
+            "newTeamTactics": new_team_tactics,
+            "oldTeamTactics": old_team_updated,
+        }
+
+    def transfer_staff(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Transfer a staff member to a target team (or release to Free Agency)."""
+        assert self.data is not None
+        staff_id = int(payload["staffId"])
+        target_team_id = int(payload["targetTeamId"])  # 0 = release
+        role = int(payload.get("role", 0))
+        replace_existing = bool(payload.get("replaceExisting", True))
+        buyout_price = int(payload.get("buyoutPrice") or 0)
+        apply_finances = bool(payload.get("applyFinances", False))
+
+        staff = self.staff_by_id.get(staff_id)
+        if not staff:
+            raise ValueError(f"Staff {staff_id} not found.")
+        if target_team_id != 0 and target_team_id not in self.teams_by_id:
+            raise ValueError(f"Target team {target_team_id} not found.")
+
+        old_contract = self.staff_contract_by_sid.get(staff_id)
+        old_team_id = old_contract["teamId"] if old_contract else 0
+
+        # Remove old contract for this staffer
+        self.data["staffContracts"]["staffContracts"] = [
+            c for c in self.data["staffContracts"]["staffContracts"] if c.get("staffId") != staff_id
+        ]
+
+        if target_team_id == 0:
+            staff["monthsSinceNewContract"] = 6
+            self.rebuild_indices()
+            self.dirty = True
+            return {"status": "released", "staffId": staff_id, "fromTeamId": old_team_id}
+
+        # Optionally release existing staffer occupying this role on target team
+        displaced_staff_id = None
+        if replace_existing:
+            kept = []
+            for c in self.data["staffContracts"]["staffContracts"]:
+                if c.get("teamId") == target_team_id and c.get("role") == role:
+                    displaced_staff_id = c["staffId"]
+                    if displaced_staff_id in self.staff_by_id:
+                        self.staff_by_id[displaced_staff_id]["monthsSinceNewContract"] = 6
+                else:
+                    kept.append(c)
+            self.data["staffContracts"]["staffContracts"] = kept
+
+        cur_dt = self.data.get("datetime", {"hour": 0, "day": 1, "month": 7, "year": 2026})
+        default_end = {"hour": 0, "day": 1, "month": 7, "year": int(cur_dt.get("year", 2026)) + 2}
+        end_date = payload.get("endDate") or (old_contract.get("endDate") if old_contract else None) or default_end
+
+        new_contract = {
+            "salaryYear": int(payload.get("salaryYear") if payload.get("salaryYear") is not None else (old_contract.get("salaryYear", 180000) if old_contract else 180000)),
+            "endDate": {
+                "hour": int(end_date.get("hour", 0)),
+                "day": int(end_date.get("day", 1)),
+                "month": int(end_date.get("month", 7)),
+                "year": int(end_date.get("year", int(cur_dt.get("year", 2026)) + 2)),
+            },
+            "teamId": target_team_id,
+            "staffId": staff_id,
+            "role": role,
+            "rejectAllStaffOffers": bool(payload.get("rejectAllStaffOffers", False)),
+        }
+        self.data["staffContracts"]["staffContracts"].append(new_contract)
+
+        staff["monthsBenchedOrWithoutContract"] = 0
+        staff["monthsSinceNewContract"] = 0
+
+        for t in self.data["teams"]["teams"]:
+            if "personInterests" in t:
+                t["personInterests"] = [
+                    pi for pi in t["personInterests"] if pi.get("staffId") != staff_id
+                ]
+
+        if old_team_id != target_team_id:
+            th_list = self.data.setdefault("transferHistories", {}).setdefault("transferHistories", [])
+            th_list.append(
+                {
+                    "personId": staff_id,
+                    "personType": 1,
+                    "transferType": 0,
+                    "datetime": copy.deepcopy(cur_dt),
+                    "purchasePrice": buyout_price,
+                    "fromTeamId": old_team_id,
+                    "otherTeamId": target_team_id,
+                }
+            )
+
+        if apply_finances and buyout_price > 0 and old_team_id != target_team_id:
+            target_team = self.teams_by_id[target_team_id]
+            tf_new = target_team.setdefault("teamFinances", {})
+            tf_new["currentBalance"] = int(tf_new.get("currentBalance", 0)) - buyout_price
+            tf_new["buyoutAndSignOnExpenses"] = int(tf_new.get("buyoutAndSignOnExpenses", 0)) + buyout_price
+            if old_team_id and old_team_id in self.teams_by_id:
+                tf_old = self.teams_by_id[old_team_id].setdefault("teamFinances", {})
+                tf_old["currentBalance"] = int(tf_old.get("currentBalance", 0)) + buyout_price
+                tf_old["buyoutIncome"] = int(tf_old.get("buyoutIncome", 0)) + buyout_price
+
+        self.rebuild_indices()
+        self.dirty = True
+        return {
+            "status": "transferred",
+            "staffId": staff_id,
+            "fromTeamId": old_team_id,
+            "targetTeamId": target_team_id,
+            "role": role,
+            "displacedStaffId": displaced_staff_id,
+        }
+
+    # ------------------------------------------------------------------
+    # Save Validator & Auto-Repair
+    # ------------------------------------------------------------------
+
+    def validate_and_fix(self, fix: bool = False) -> dict[str, Any]:
+        assert self.data is not None
+        issues: list[dict[str, Any]] = []
+        fixed_teams: set[int] = set()
+
+        # Check duplicate player contracts
+        seen_pids: set[int] = set()
+        dup_pids: set[int] = set()
+        for c in self.data["playerContracts"]["playerContracts"]:
+            pid = c["playerId"]
+            if pid in seen_pids:
+                dup_pids.add(pid)
+            seen_pids.add(pid)
+        if dup_pids:
+            issues.append({"type": "duplicate_player_contracts", "playerIds": sorted(dup_pids)})
+            if fix:
+                kept = {}
+                for c in self.data["playerContracts"]["playerContracts"]:
+                    kept[c["playerId"]] = c
+                self.data["playerContracts"]["playerContracts"] = list(kept.values())
+                self.rebuild_indices()
+
+        # Check every team's tactics vs active roster
+        for team in self.data["teams"]["teams"]:
+            tid = team["id"]
+            contracts = self.get_team_player_contracts(tid)
+            active_ids = {c["playerId"] for c in contracts if not c.get("benched", False)}
+            benched_ids = {c["playerId"] for c in contracts if c.get("benched", False)}
+
+            team_problems: list[str] = []
+            for gt in team.get("generalTactics", []):
+                for f in ("iglId", "secondIglId", "sniperId", "secondSniperId"):
+                    val = gt.get(f, 0)
+                    if val != 0 and val not in active_ids:
+                        team_problems.append(f"generalTactics.{f}={val} not active")
+
+            for mt in team.get("mapTactics", []):
+                if mt.get("active"):
+                    occ = {mp["roleOccupantId"] for mp in mt.get("mapPositions", []) if mp.get("roleOccupantId", 0) != 0}
+                    stale = occ - active_ids
+                    missing = active_ids - occ
+                    if stale:
+                        team_problems.append(f"mapId={mt['mapId']} has non-active occupants {sorted(stale)}")
+                    if missing and active_ids:
+                        team_problems.append(f"mapId={mt['mapId']} missing active players {sorted(missing)}")
+
+            if len(active_ids) > 5:
+                team_problems.append(f"active count is {len(active_ids)} (> 5)")
+            elif len(active_ids) < 5 and len(benched_ids) > 0:
+                team_problems.append(f"active count is {len(active_ids)} with {len(benched_ids)} benched player(s) available")
+
+            if team_problems:
+                issues.append({"type": "team_tactics_mismatch", "teamId": tid, "teamName": team["name"], "details": team_problems})
+                if fix:
+                    if len(active_ids) > 5:
+                        starters = [c for c in contracts if not c.get("benched", False)]
+                        starters.sort(key=lambda c: _player_avg_skill(self.players_by_id.get(c["playerId"], {})))
+                        for c in starters[: len(starters) - 5]:
+                            c["benched"] = True
+                    elif len(active_ids) < 5 and len(benched_ids) > 0:
+                        benched = [c for c in contracts if c.get("benched", False)]
+                        benched.sort(
+                            key=lambda c: _player_avg_skill(self.players_by_id.get(c["playerId"], {})),
+                            reverse=True,
+                        )
+                        for c in benched[: 5 - len(active_ids)]:
+                            c["benched"] = False
+                    if active_ids or len(benched_ids) > 0:
+                        self.recalculate_ai_tactics(tid)
+                        fixed_teams.add(tid)
+
+        return {
+            "issueCount": len(issues),
+            "issues": issues,
+            "fixed": fix,
+            "fixedTeamCount": len(fixed_teams),
+            "fixedTeamIds": sorted(fixed_teams),
+        }
+
+    # ------------------------------------------------------------------
+    # Query & Update Endpoints
+    # ------------------------------------------------------------------
+
+    def list_players(self, q: str = "", team_id: str = "", nation: str = "", free_only: bool = False, offset: int = 0, limit: int = 100) -> dict[str, Any]:
+        assert self.data is not None
+        ql = q.strip().lower()
+        rows = []
+        for p in self.data["players"]["players"]:
+            pid = p["id"]
+            c = self.player_contract_by_pid.get(pid)
+            tid = c["teamId"] if c else 0
+            if free_only and c is not None:
+                continue
+            if team_id != "" and str(tid) != str(team_id):
+                continue
+            if nation != "" and str(p.get("nation")) != str(nation):
+                continue
+            if ql:
+                tname = self.teams_by_id[tid]["name"].lower() if tid in self.teams_by_id else "free agent"
+                if ql not in p.get("name", "").lower() and ql not in tname and ql != str(pid):
+                    continue
+            tname = self.teams_by_id[tid]["name"] if tid in self.teams_by_id else "Free Agent"
+            rows.append(
+                {
+                    "id": pid,
+                    "name": p.get("name", ""),
+                    "age": p.get("age", 0),
+                    "nation": p.get("nation", 0),
+                    "nationName": NATIONS.get(p.get("nation", 0), f"Nation {p.get('nation')}"),
+                    "reputation": p.get("reputation", 1),
+                    "preferredMentality": p.get("preferredMentality", 1),
+                    "teamId": tid,
+                    "teamName": tname,
+                    "benched": bool(c.get("benched")) if c else False,
+                    "status": c.get("status") if c else None,
+                    "igl": c.get("igl", 2) if c else 2,
+                    "sniper": c.get("sniper", 2) if c else 2,
+                    "salaryYear": c.get("salaryYear", 0) if c else 0,
+                    "avgSkill": _player_avg_skill(p),
+                }
+            )
+        rows.sort(key=lambda r: (-r["avgSkill"], r["name"].lower()))
+        total = len(rows)
+        return {"total": total, "items": rows[offset : offset + limit]}
+
+    def get_player(self, player_id: int) -> dict[str, Any]:
+        p = self.players_by_id.get(player_id)
+        if not p:
+            raise ValueError(f"Player {player_id} not found.")
+        c = self.player_contract_by_pid.get(player_id)
+        tid = c["teamId"] if c else 0
+        return {
+            "player": copy.deepcopy(p),
+            "contract": copy.deepcopy(c) if c else None,
+            "teamId": tid,
+            "teamName": self.teams_by_id[tid]["name"] if tid in self.teams_by_id else "Free Agent",
+        }
+
+    def update_player(self, player_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        assert self.data is not None
+        p = self.players_by_id.get(player_id)
+        if not p:
+            raise ValueError(f"Player {player_id} not found.")
+        pdata = payload.get("player", {})
+        for k in (
+            "name", "age", "nation", "reputation", "preferredMentality",
+            "setForRetirement", "monthsBenchedOrWithoutContract", "monthsSinceNewContract",
+            "longevity", "temporaryStandIn", "dontReplaceOnRetire", "academyPlayer",
+        ):
+            if k in pdata:
+                p[k] = pdata[k]
+
+        if "skills" in pdata:
+            p["skills"].update({k: float(v) for k, v in pdata["skills"].items()})
+        if "potential" in pdata:
+            p["potential"] = pdata["potential"]
+        if "languagesSpoken" in pdata:
+            p["languagesSpoken"] = pdata["languagesSpoken"]
+        if "mapPositionAttributes" in pdata:
+            p["mapPositionAttributes"] = pdata["mapPositionAttributes"]
+        if "mapOpinions" in pdata:
+            p["mapOpinions"] = pdata["mapOpinions"]
+        if "personality" in pdata:
+            p["personality"].update({k: int(v) for k, v in pdata["personality"].items()})
+
+        if "contract" in payload and payload["contract"] is not None:
+            cdata = payload["contract"]
+            existing = self.player_contract_by_pid.get(player_id)
+            if existing:
+                for k in (
+                    "salaryYear", "endDate", "status", "sniper", "igl", "benched",
+                    "signingOnFee", "transferStatus", "askingPrice", "contractType",
+                ):
+                    if k in cdata:
+                        existing[k] = cdata[k]
+                if "teamId" in cdata and int(cdata["teamId"]) != existing["teamId"]:
+                    # Route teamId change through transfer logic so tactics stay valid!
+                    self.transfer_player(
+                        {
+                            "playerId": player_id,
+                            "targetTeamId": int(cdata["teamId"]),
+                            "salaryYear": existing["salaryYear"],
+                            "endDate": existing["endDate"],
+                            "status": existing["status"],
+                            "sniper": existing["sniper"],
+                            "igl": existing["igl"],
+                            "joinBenched": existing["benched"],
+                            "signingOnFee": existing["signingOnFee"],
+                            "transferStatus": existing["transferStatus"],
+                            "askingPrice": existing["askingPrice"],
+                            "contractType": existing["contractType"],
+                        }
+                    )
+            elif int(cdata.get("teamId", 0)) > 0:
+                self.transfer_player(
+                    {
+                        "playerId": player_id,
+                        "targetTeamId": int(cdata["teamId"]),
+                        "salaryYear": cdata.get("salaryYear", 250000),
+                        "endDate": cdata.get("endDate"),
+                        "status": cdata.get("status", 1),
+                        "sniper": cdata.get("sniper", 2),
+                        "igl": cdata.get("igl", 2),
+                        "joinBenched": cdata.get("benched", False),
+                        "signingOnFee": cdata.get("signingOnFee", 0),
+                        "transferStatus": cdata.get("transferStatus", 0),
+                        "askingPrice": cdata.get("askingPrice", 0),
+                        "contractType": cdata.get("contractType", 0),
+                    }
+                )
+        self.dirty = True
+        return self.get_player(player_id)
+
+    def list_staff(self, q: str = "", team_id: str = "", role: str = "", free_only: bool = False, offset: int = 0, limit: int = 100) -> dict[str, Any]:
+        assert self.data is not None
+        ql = q.strip().lower()
+        rows = []
+        for s in self.data["staffers"]["staffers"]:
+            sid = s["id"]
+            c = self.staff_contract_by_sid.get(sid)
+            tid = c["teamId"] if c else 0
+            srole = c.get("role") if c else None
+            if free_only and c is not None:
+                continue
+            if team_id != "" and str(tid) != str(team_id):
+                continue
+            if role != "" and str(srole) != str(role):
+                continue
+            if ql:
+                tname = self.teams_by_id[tid]["name"].lower() if tid in self.teams_by_id else "free agent"
+                if ql not in s.get("name", "").lower() and ql not in tname and ql != str(sid):
+                    continue
+            tname = self.teams_by_id[tid]["name"] if tid in self.teams_by_id else "Free Agent"
+            rows.append(
+                {
+                    "id": sid,
+                    "name": s.get("name", ""),
+                    "age": s.get("age", 0),
+                    "nation": s.get("nation", 0),
+                    "nationName": NATIONS.get(s.get("nation", 0), f"Nation {s.get('nation')}"),
+                    "reputation": s.get("reputation", 1),
+                    "preferredMentality": s.get("preferredMentality", 1),
+                    "teamId": tid,
+                    "teamName": tname,
+                    "role": srole,
+                    "roleName": STAFF_ROLES.get(srole, "Free Agent") if srole is not None else "Free Agent",
+                    "salaryYear": c.get("salaryYear", 0) if c else 0,
+                    "avgSkill": _staff_avg_skill(s),
+                }
+            )
+        rows.sort(key=lambda r: (-r["avgSkill"], r["name"].lower()))
+        total = len(rows)
+        return {"total": total, "items": rows[offset : offset + limit]}
+
+    def get_staff(self, staff_id: int) -> dict[str, Any]:
+        s = self.staff_by_id.get(staff_id)
+        if not s:
+            raise ValueError(f"Staff {staff_id} not found.")
+        c = self.staff_contract_by_sid.get(staff_id)
+        tid = c["teamId"] if c else 0
+        return {
+            "staff": copy.deepcopy(s),
+            "contract": copy.deepcopy(c) if c else None,
+            "teamId": tid,
+            "teamName": self.teams_by_id[tid]["name"] if tid in self.teams_by_id else "Free Agent",
+        }
+
+    def update_staff(self, staff_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        assert self.data is not None
+        s = self.staff_by_id.get(staff_id)
+        if not s:
+            raise ValueError(f"Staff {staff_id} not found.")
+        sdata = payload.get("staff", {})
+        for k in (
+            "name", "age", "nation", "reputation", "preferredMentality",
+            "setForRetirement", "retirementConsiderationAge",
+            "monthsBenchedOrWithoutContract", "monthsSinceNewContract",
+        ):
+            if k in sdata:
+                s[k] = sdata[k]
+        if "skills" in sdata:
+            s["skills"].update({k: float(v) for k, v in sdata["skills"].items()})
+        if "potential" in sdata:
+            s["potential"] = sdata["potential"]
+        if "languagesSpoken" in sdata:
+            s["languagesSpoken"] = sdata["languagesSpoken"]
+        if "careerInterests" in sdata:
+            s["careerInterests"] = sdata["careerInterests"]
+
+        if "contract" in payload and payload["contract"] is not None:
+            cdata = payload["contract"]
+            existing = self.staff_contract_by_sid.get(staff_id)
+            if existing:
+                for k in ("salaryYear", "endDate", "role", "rejectAllStaffOffers"):
+                    if k in cdata:
+                        existing[k] = cdata[k]
+                if "teamId" in cdata and int(cdata["teamId"]) != existing["teamId"]:
+                    self.transfer_staff(
+                        {
+                            "staffId": staff_id,
+                            "targetTeamId": int(cdata["teamId"]),
+                            "role": existing["role"],
+                            "salaryYear": existing["salaryYear"],
+                            "endDate": existing["endDate"],
+                            "rejectAllStaffOffers": existing["rejectAllStaffOffers"],
+                        }
+                    )
+            elif int(cdata.get("teamId", 0)) > 0:
+                self.transfer_staff(
+                    {
+                        "staffId": staff_id,
+                        "targetTeamId": int(cdata["teamId"]),
+                        "role": cdata.get("role", 0),
+                        "salaryYear": cdata.get("salaryYear", 180000),
+                        "endDate": cdata.get("endDate"),
+                        "rejectAllStaffOffers": cdata.get("rejectAllStaffOffers", False),
+                    }
+                )
+        self.dirty = True
+        return self.get_staff(staff_id)
+
+    def list_teams(self, q: str = "") -> list[dict[str, Any]]:
+        assert self.data is not None
+        ql = q.strip().lower()
+        user_tid = self.data.get("profile", {}).get("team", 0)
+        rows = []
+        for t in self.data["teams"]["teams"]:
+            tid = t["id"]
+            if ql and ql not in t.get("name", "").lower() and ql != str(tid):
+                continue
+            pcs = self.get_team_player_contracts(tid)
+            scs = self.get_team_staff_contracts(tid)
+            active_cnt = sum(1 for c in pcs if not c.get("benched"))
+            rows.append(
+                {
+                    "id": tid,
+                    "name": t.get("name", ""),
+                    "nation": t.get("nation", 0),
+                    "nationName": NATIONS.get(t.get("nation", 0), ""),
+                    "reputation": t.get("reputation", 1),
+                    "professionalStatus": t.get("professionalStatus", 0),
+                    "financialStrength": t.get("financialStrength", 1),
+                    "balance": t.get("teamFinances", {}).get("currentBalance", 0),
+                    "activeCount": active_cnt,
+                    "benchedCount": len(pcs) - active_cnt,
+                    "staffCount": len(scs),
+                    "isUserTeam": tid == user_tid,
+                }
+            )
+        rows.sort(key=lambda r: (not r["isUserTeam"], -r["reputation"], r["name"].lower()))
+        return rows
+
+    def get_team(self, team_id: int) -> dict[str, Any]:
+        t = self.teams_by_id.get(team_id)
+        if not t:
+            raise ValueError(f"Team {team_id} not found.")
+        pcs = self.get_team_player_contracts(team_id)
+        roster = []
+        for c in pcs:
+            p = self.players_by_id.get(c["playerId"])
+            if p:
+                roster.append(
+                    {
+                        "playerId": p["id"],
+                        "name": p["name"],
+                        "age": p["age"],
+                        "nationName": NATIONS.get(p.get("nation", 0), ""),
+                        "avgSkill": _player_avg_skill(p),
+                        "benched": bool(c.get("benched")),
+                        "status": c.get("status", 1),
+                        "igl": c.get("igl", 2),
+                        "sniper": c.get("sniper", 2),
+                        "salaryYear": c.get("salaryYear", 0),
+                        "endDate": c.get("endDate", {}),
+                    }
+                )
+        roster.sort(key=lambda r: (r["benched"], -r["avgSkill"]))
+
+        scs = self.get_team_staff_contracts(team_id)
+        staff_roster = []
+        for c in scs:
+            s = self.staff_by_id.get(c["staffId"])
+            if s:
+                staff_roster.append(
+                    {
+                        "staffId": s["id"],
+                        "name": s["name"],
+                        "age": s["age"],
+                        "role": c.get("role", 0),
+                        "roleName": STAFF_ROLES.get(c.get("role", 0), "Staff"),
+                        "avgSkill": _staff_avg_skill(s),
+                        "salaryYear": c.get("salaryYear", 0),
+                        "endDate": c.get("endDate", {}),
+                    }
+                )
+        staff_roster.sort(key=lambda r: r["role"])
+
+        team_copy = copy.deepcopy(t)
+        # Keep payload snappy by trimming massive historical arrays not edited in org stats
+        for heavy in ("rankingPoints", "rankingHistory", "mapStats", "playbooks"):
+            team_copy.pop(heavy, None)
+
+        return {
+            "team": team_copy,
+            "roster": roster,
+            "staff": staff_roster,
+            "isUserTeam": team_id == self.data.get("profile", {}).get("team", 0),
+        }
+
+    def update_team(self, team_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        t = self.teams_by_id.get(team_id)
+        if not t:
+            raise ValueError(f"Team {team_id} not found.")
+        tdata = payload.get("team", {})
+        for k in (
+            "name", "nation", "reputation", "reputationProgress", "professionalStatus",
+            "financialStrength", "coffeeMachine", "cable", "ventilation", "recreation",
+            "branding", "academy", "academyFocus",
+        ):
+            if k in tdata:
+                t[k] = tdata[k]
+        if "owner" in tdata:
+            t.setdefault("owner", {}).update(tdata["owner"])
+        if "teamFinances" in tdata:
+            t.setdefault("teamFinances", {}).update(tdata["teamFinances"])
+        if "teamCohesion" in tdata:
+            t.setdefault("teamCohesion", {}).update(tdata["teamCohesion"])
+        if "jobSecurity" in tdata:
+            t.setdefault("jobSecurity", {}).update(tdata["jobSecurity"])
+        self.dirty = True
+        return self.get_team(team_id)
+
+    def list_transfers(self, limit: int = 80) -> list[dict[str, Any]]:
+        assert self.data is not None
+        items = self.data.get("transferHistories", {}).get("transferHistories", [])
+        out = []
+        for th in reversed(items[-limit:]):
+            ptype = th.get("personType", 0)
+            pid = th.get("personId", 0)
+            if ptype == 0:
+                name = self.players_by_id.get(pid, {}).get("name", f"Player #{pid}")
+            else:
+                name = self.staff_by_id.get(pid, {}).get("name", f"Staff #{pid}")
+            from_id = th.get("fromTeamId", 0)
+            to_id = th.get("otherTeamId", 0)
+            out.append(
+                {
+                    "personId": pid,
+                    "personName": name,
+                    "personType": "Player" if ptype == 0 else "Staff",
+                    "fromTeamName": self.teams_by_id.get(from_id, {}).get("name", "Free Agent") if from_id else "Free Agent",
+                    "toTeamName": self.teams_by_id.get(to_id, {}).get("name", "Free Agent") if to_id else "Free Agent",
+                    "purchasePrice": th.get("purchasePrice", 0),
+                    "datetime": th.get("datetime", {}),
+                }
+            )
+        return out
+
+    def _default_portrait(self, age: int = 20) -> dict[str, int]:
+        assert self.data is not None
+        pool = self.data["players"]["players"] + self.data["staffers"]["staffers"]
+        if pool:
+            p = copy.deepcopy(random.choice(pool).get("portrait", {}))
+            if p:
+                if age < 28:
+                    p["wrinkes"] = 0
+                return p
+        return {
+            "face": random.randint(1, 3),
+            "nose": random.randint(1, 11),
+            "mouth": random.randint(1, 13),
+            "mouthColor": random.randint(1, 6),
+            "eyes": random.randint(1, 12),
+            "eyeballsColor": random.randint(1, 7),
+            "eyebrows": random.randint(0, 11),
+            "eyebrowsColor": random.randint(1, 9),
+            "hair": random.randint(1, 44),
+            "hairColor": random.randint(1, 9),
+            "beard": 0 if age < 20 else random.randint(0, 15),
+            "beardColor": random.randint(1, 9),
+            "accessory": 0,
+            "accessoryColor": 1,
+            "wrinkes": 0 if age < 28 else random.randint(0, 3),
+            "skinColor": random.randint(1, 5),
+            "neck": random.randint(1, 2),
+        }
+
+    def create_player(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Create a brand-new player and optionally sign them to a team."""
+        assert self.data is not None
+        pdata = payload.get("player", payload)
+        name = str(pdata.get("name", "")).strip()
+        if not name:
+            raise ValueError("Player name / alias cannot be empty.")
+
+        age = int(_clamp(int(pdata.get("age", 19)), 15, 55))
+        nation = int(pdata.get("nation", 1))
+        reputation = int(_clamp(int(pdata.get("reputation", 10)), 1, 20))
+        mentality = int(_clamp(int(pdata.get("preferredMentality", 1)), 0, 2))
+        longevity = int(pdata.get("longevity", 30))
+        base_skill = float(_clamp(float(pdata.get("baseSkill", 12.0)), 1.0, 20.0))
+        base_pot = int(_clamp(int(pdata.get("basePotential", max(int(round(base_skill)) + 3, 15))), 1, 20))
+
+        raw_skills = pdata.get("skills", {})
+        skills: dict[str, float] = {}
+        for sk in PLAYER_SKILLS:
+            key = sk["key"]
+            skills[key] = float(_clamp(float(raw_skills.get(key, base_skill)), 1.0, 20.0))
+
+        raw_pot = pdata.get("potential", {})
+        if isinstance(raw_pot, dict) and "m_Keys" in raw_pot and "m_Values" in raw_pot:
+            pot_map = {int(k): int(_clamp(int(v), 1, 20)) for k, v in zip(raw_pot["m_Keys"], raw_pot["m_Values"])}
+        else:
+            pot_map = {}
+        pot_keys = [sk["id"] for sk in PLAYER_SKILLS]
+        pot_vals = [
+            int(_clamp(max(pot_map.get(sk["id"], base_pot), int(skills[sk["key"]])), 1, 20))
+            for sk in PLAYER_SKILLS
+        ]
+
+        langs = pdata.get("languagesSpoken")
+        if not langs:
+            langs = [{"languageId": 13, "languageSkill": 20, "limit": 20, "progress": 0.0}]
+
+        raw_roles = pdata.get("mapPositionAttributes")
+        if raw_roles:
+            role_attrs = raw_roles
+        else:
+            role_comforts = pdata.get("roleComforts", {})
+            role_attrs = [
+                {
+                    "positionType": pos_id,
+                    "roleComfort": int(_clamp(int(role_comforts.get(str(pos_id), 6)), 1, 10)),
+                    "progress": 30.0,
+                }
+                for pos_id in sorted(PLAYER_POSITIONS.keys())
+            ]
+
+        raw_maps = pdata.get("mapOpinions")
+        if raw_maps is not None:
+            map_opinions = raw_maps
+        else:
+            map_opinions = [
+                {"mapId": m["id"], "like": True}
+                for m in self.data.get("maps", {}).get("maps", [])
+            ]
+
+        raw_pers = pdata.get("personality", {})
+        personality = {
+            "quietPassion": int(_clamp(int(raw_pers.get("quietPassion", 10)), 1, 20)),
+            "kindMean": int(_clamp(int(raw_pers.get("kindMean", 10)), 1, 20)),
+            "loyalMercenary": int(_clamp(int(raw_pers.get("loyalMercenary", 10)), 1, 20)),
+            "contentAmbition": int(_clamp(int(raw_pers.get("contentAmbition", 10)), 1, 20)),
+            "stressproneResillient": int(_clamp(int(raw_pers.get("stressproneResillient", 10)), 1, 20)),
+            "desireToIgl": int(_clamp(int(raw_pers.get("desireToIgl", 8)), 1, 20)),
+            "desireToAwp": int(_clamp(int(raw_pers.get("desireToAwp", 8)), 1, 20)),
+        }
+
+        new_id = max((p["id"] for p in self.data["players"]["players"]), default=0) + 1
+        new_player: dict[str, Any] = {
+            "id": new_id,
+            "name": name,
+            "age": age,
+            "nation": nation,
+            "reputation": reputation,
+            "portrait": self._default_portrait(age),
+            "preferredMentality": mentality,
+            "languagesSpoken": langs,
+            "setForRetirement": bool(pdata.get("setForRetirement", False)),
+            "monthsBenchedOrWithoutContract": 0,
+            "monthsSinceNewContract": 6,
+            "reputationProgress": 0.0,
+            "potential": {"m_Keys": pot_keys, "m_Values": pot_vals},
+            "playerAwards": [],
+            "recentlyAgreedToResolveDilemmaScore": 0.0,
+            "skills": skills,
+            "mapPositionAttributes": role_attrs,
+            "mapOpinions": map_opinions,
+            "mood": {
+                "moodFromTournamentReputation": 0.0,
+                "moodFromBurnout": 0.0,
+                "moodFromRelationships": 0.0,
+                "moodFromDialog": 0.0,
+                "moodFromPersonality": 0.25,
+                "moodFromPracticeDialog": 0.0,
+                "moodsFromMatches": [],
+                "moodsFromTournaments": [],
+            },
+            "personality": personality,
+            "burnout": {"burnoutFromPractice": 0.0, "burnoutFromMatches": 0.0},
+            "longevity": longevity,
+            "dialogCooldown": 0,
+            "preliminaryDialogCooldown": 0,
+            "temporaryStandIn": False,
+            "dontReplaceOnRetire": False,
+            "academyPlayer": False,
+            "skillOffset": -1,
+            "dialogStage": 0,
+            "dialogConsideration": 0,
+            "dialogKey": 0,
+            "practiceRatings": [],
+            "useStartingPotential": False,
+            "startingPotential": 0,
+        }
+
+        self.data["players"]["players"].append(new_player)
+        self.rebuild_indices()
+        self.dirty = True
+
+        contract_cfg = payload.get("contract") or {}
+        target_team_id = int(contract_cfg.get("teamId") or payload.get("targetTeamId") or 0)
+        if target_team_id > 0:
+            self.transfer_player(
+                {
+                    "playerId": new_id,
+                    "targetTeamId": target_team_id,
+                    "benchPlayerId": int(contract_cfg.get("benchPlayerId") or payload.get("benchPlayerId") or 0),
+                    "joinBenched": bool(contract_cfg.get("benched", False)),
+                    "autoPromoteOldTeam": False,
+                    "buyoutPrice": 0,
+                    "applyFinances": False,
+                    "salaryYear": int(contract_cfg.get("salaryYear", 250000)),
+                    "endDate": contract_cfg.get("endDate"),
+                    "status": int(contract_cfg.get("status", 1)),
+                    "igl": int(contract_cfg.get("igl", 2)),
+                    "sniper": int(contract_cfg.get("sniper", 2)),
+                    "contractType": int(contract_cfg.get("contractType", 0)),
+                    "signingOnFee": int(contract_cfg.get("signingOnFee", 0)),
+                }
+            )
+
+        return self.get_player(new_id)
+
+    def create_staff(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Create a brand-new staff member and optionally sign them to a team."""
+        assert self.data is not None
+        sdata = payload.get("staff", payload)
+        name = str(sdata.get("name", "")).strip()
+        if not name:
+            raise ValueError("Staff name / alias cannot be empty.")
+
+        age = int(_clamp(int(sdata.get("age", 34)), 20, 85))
+        nation = int(sdata.get("nation", 1))
+        reputation = int(_clamp(int(sdata.get("reputation", 10)), 1, 20))
+        mentality = int(_clamp(int(sdata.get("preferredMentality", 1)), 0, 3))
+        retire_age = int(sdata.get("retirementConsiderationAge", 65))
+        base_skill = float(_clamp(float(sdata.get("baseSkill", 12.0)), 1.0, 20.0))
+        base_pot = int(_clamp(int(sdata.get("basePotential", max(int(round(base_skill)) + 3, 15))), 1, 20))
+
+        raw_skills = sdata.get("skills", {})
+        skills: dict[str, float] = {}
+        for sk in STAFF_SKILLS:
+            key = sk["key"]
+            skills[key] = float(_clamp(float(raw_skills.get(key, base_skill)), 1.0, 20.0))
+
+        raw_pot = sdata.get("potential", {})
+        if isinstance(raw_pot, dict) and "m_Keys" in raw_pot and "m_Values" in raw_pot:
+            pot_map = {int(k): int(_clamp(int(v), 1, 20)) for k, v in zip(raw_pot["m_Keys"], raw_pot["m_Values"])}
+        else:
+            pot_map = {}
+        pot_keys = [sk["id"] for sk in STAFF_SKILLS]
+        pot_vals = [
+            int(_clamp(max(pot_map.get(sk["id"], base_pot), int(skills[sk["key"]])), 1, 20))
+            for sk in STAFF_SKILLS
+        ]
+
+        langs = sdata.get("languagesSpoken")
+        if not langs:
+            langs = [{"languageId": 13, "languageSkill": 20, "limit": 20, "progress": 0.0}]
+
+        contract_cfg = payload.get("contract") or {}
+        preferred_role = int(contract_cfg.get("role", 0))
+        raw_ci = sdata.get("careerInterests")
+        if raw_ci:
+            career_interests = raw_ci
+        else:
+            career_interests = [
+                {
+                    "roleType": r_id,
+                    "roleInterest": 20 if r_id == preferred_role else 10,
+                }
+                for r_id in sorted(STAFF_ROLES.keys())
+            ]
+
+        new_id = max((s["id"] for s in self.data["staffers"]["staffers"]), default=0) + 1
+        new_staff: dict[str, Any] = {
+            "id": new_id,
+            "name": name,
+            "age": age,
+            "nation": nation,
+            "reputation": reputation,
+            "portrait": self._default_portrait(age),
+            "preferredMentality": mentality,
+            "languagesSpoken": langs,
+            "setForRetirement": bool(sdata.get("setForRetirement", False)),
+            "monthsBenchedOrWithoutContract": 0,
+            "monthsSinceNewContract": 6,
+            "reputationProgress": 0.0,
+            "potential": {"m_Keys": pot_keys, "m_Values": pot_vals},
+            "playerAwards": [],
+            "recentlyAgreedToResolveDilemmaScore": 0.0,
+            "skills": skills,
+            "careerInterests": career_interests,
+            "retirementConsiderationAge": retire_age,
+            "careerStats": [],
+        }
+
+        self.data["staffers"]["staffers"].append(new_staff)
+        self.rebuild_indices()
+        self.dirty = True
+
+        target_team_id = int(contract_cfg.get("teamId") or payload.get("targetTeamId") or 0)
+        if target_team_id > 0:
+            self.transfer_staff(
+                {
+                    "staffId": new_id,
+                    "targetTeamId": target_team_id,
+                    "role": preferred_role,
+                    "replaceExisting": bool(contract_cfg.get("replaceExisting", True)),
+                    "buyoutPrice": 0,
+                    "applyFinances": False,
+                    "salaryYear": int(contract_cfg.get("salaryYear", 180000)),
+                    "endDate": contract_cfg.get("endDate"),
+                    "rejectAllStaffOffers": bool(contract_cfg.get("rejectAllStaffOffers", False)),
+                }
+            )
+
+        return self.get_staff(new_id)
+
+    # ------------------------------------------------------------------
+    # Detailed Statistics & Match Analytics
+    # ------------------------------------------------------------------
+
+    def _stats_lookups(self) -> tuple[dict[int, str], dict[int, dict[str, Any]], dict[int, str]]:
+        assert self.data is not None
+        tmpl_names: dict[int, str] = {}
+        tourn_by_id: dict[int, dict[str, Any]] = {}
+        raw_tourns: dict[int, dict[str, Any]] = {}
+        for t in self.data.get("tournaments", {}).get("tournaments", []):
+            raw_tourns[t["id"]] = t
+            if "template" in t:
+                tmpl_names.setdefault(t["template"], t.get("name", f"Tournament #{t['template']}"))
+        # Match.tournamentId always references tournamentStages[].id (never tournaments[].id directly,
+        # which has an overlapping 1..N ID space and would mislabel matches like Major Playoffs #30 as Stake Pulse #30).
+        for s in self.data.get("tournamentStages", {}).get("tournamentStages", []):
+            sid = s.get("id")
+            if sid is None:
+                continue
+            parent = raw_tourns.get(s.get("parentId"), {})
+            base_name = parent.get("name") or tmpl_names.get(s.get("parentTemplate")) or f"Tournament #{sid}"
+            raw_stage = s.get("name", "")
+            stage_label = raw_stage.split("__", 1)[0].replace("_", " ").strip().title() if raw_stage else ""
+            full_name = f"{base_name} ({stage_label})" if stage_label else base_name
+            tourn_by_id[sid] = {
+                "id": sid,
+                "name": full_name,
+                "parentId": s.get("parentId"),
+                "reputation": parent.get("reputation", 1),
+            }
+        map_names = {m["id"]: m.get("name", f"Map {m['id']}") for m in self.data.get("maps", {}).get("maps", [])}
+        return tmpl_names, tourn_by_id, map_names
+
+    @staticmethod
+    def _match_date_key(dt_obj: dict[str, Any]) -> tuple[int, int, int, int]:
+        return (
+            int(dt_obj.get("year", 0)),
+            int(dt_obj.get("month", 0)),
+            int(dt_obj.get("day", 0)),
+            int(dt_obj.get("hour", 0)),
+        )
+
+    @staticmethod
+    def _parse_map_player_stat(ps: dict[str, Any]) -> dict[str, int]:
+        d = ps.get("data", [])
+        pid = int(d[0]) if len(d) > 0 else 0
+        assists = int(d[1]) if len(d) > 1 else 0
+        flash_assists = int(d[2]) if len(d) > 2 else 0
+        deaths = int(d[3]) if len(d) > 3 else 0
+        damage = int(d[4]) if len(d) > 4 else 0
+        hs_kills = int(d[5]) if len(d) > 5 else 0
+        k2 = int(d[6]) if len(d) > 6 else 0
+        k3 = int(d[7]) if len(d) > 7 else 0
+        k4 = int(d[8]) if len(d) > 8 else 0
+        k5 = int(d[9]) if len(d) > 9 else 0
+        opening_deaths = int(d[10]) if len(d) > 10 else 0
+
+        kills = 0
+        opening_kills = 0
+        sniper_kills = 0
+        clutch_kills = 0
+        for mk in ps.get("matrixKills", []):
+            md = mk.get("data", [])
+            if len(md) >= 5:
+                kills += int(md[1])
+                opening_kills += int(md[2])
+                sniper_kills += int(md[3])
+                clutch_kills += int(md[4])
+
+        return {
+            "playerId": pid,
+            "kills": kills,
+            "assists": assists,
+            "flashAssists": flash_assists,
+            "deaths": deaths,
+            "damage": damage,
+            "hsKills": hs_kills,
+            "k2": k2,
+            "k3": k3,
+            "k4": k4,
+            "k5": k5,
+            "openingKills": opening_kills,
+            "openingDeaths": opening_deaths,
+            "sniperKills": sniper_kills,
+            "clutchKills": clutch_kills,
+        }
+
+    def _compute_top20_prediction(self, pred_year: int) -> dict[str, Any]:
+        """Replicate DashboardManager::CheckForPlayerOfTheYearEvents Top 20 formula."""
+        assert self.data is not None
+        cur_dt = self.data.get("datetime", {}) or {}
+        cur_save_year = int(cur_dt.get("year", 0) or 0)
+
+        # Aggregate year-level overall & vs-Top-10 career stats (opponentRank == 3)
+        stats_by_pid: dict[int, dict[str, Any]] = {}
+        for row in self.data.get("playerCareerStats", {}).get("playerCareerStats", []):
+            if int(row.get("year", 0) or 0) != pred_year:
+                continue
+            mw = int(row.get("matchesWon", 0) or 0)
+            ml = int(row.get("matchesLost", 0) or 0)
+            matches_cnt = mw + ml
+            if matches_cnt <= 0:
+                continue
+            pid = int(row.get("playerId", 0) or 0)
+            if not pid:
+                continue
+            acc_r = float(row.get("accumulativeRating", 0.0) or 0.0)
+            agg = stats_by_pid.setdefault(
+                pid,
+                {"allMatches": 0, "allAcc": 0.0, "t10Matches": 0, "t10Acc": 0.0},
+            )
+            agg["allMatches"] += matches_cnt
+            agg["allAcc"] += acc_r
+            if int(row.get("opponentRank", 0) or 0) == 3:
+                agg["t10Matches"] += matches_cnt
+                agg["t10Acc"] += acc_r
+
+        # Check Dec 23 game snapshot if predicting the current in-game year
+        save_poty_by_pid: dict[int, dict[str, Any]] = {}
+        save_vote_pid = 0
+        if pred_year == cur_save_year:
+            for srow in self.data.get("profile", {}).get("playerOfTheYearScores", []) or []:
+                spid = int(srow.get("playerId", 0) or 0)
+                if spid:
+                    voted = bool(srow.get("profileVote", False))
+                    if voted:
+                        save_vote_pid = spid
+                    save_poty_by_pid[spid] = {
+                        "rating": round(float(srow.get("rating", 0.0) or 0.0), 4),
+                        "score": round(float(srow.get("score", 0.0) or 0.0), 4),
+                        "voted": voted,
+                    }
+
+        candidates: list[dict[str, Any]] = []
+        snubbed_pool: list[dict[str, Any]] = []
+        finalized = False
+
+        for p in self.data["players"]["players"]:
+            pid = p["id"]
+            st = stats_by_pid.get(pid)
+            if not st:
+                continue
+            all_m = st["allMatches"]
+            all_r = (st["allAcc"] / all_m) if all_m > 0 else 0.0
+            t10_m = st["t10Matches"]
+            t10_r = (st["t10Acc"] / t10_m) if t10_m > 0 else 0.0
+
+            mvps = 0
+            evps = 0
+            actual_top20 = 0
+            for a in p.get("playerAwards", []) or []:
+                if int(a.get("year", 0) or 0) != pred_year:
+                    continue
+                atype = int(a.get("type", -1))
+                if atype == 0:
+                    mvps += 1
+                elif atype == 2:
+                    evps += 1
+                elif atype == 3:
+                    place = int(a.get("top20Placement", 0) or 0)
+                    if place > 0:
+                        actual_top20 = place
+                        finalized = True
+
+            c = self.player_contract_by_pid.get(pid)
+            cur_tid = c["teamId"] if c else 0
+            cur_tname = self.teams_by_id[cur_tid]["name"] if cur_tid in self.teams_by_id else "Free Agent"
+
+            if (mvps + evps) > 0 and t10_m > 0:
+                award_mult = (1.05 ** mvps) * (1.01 ** evps)
+                sample_w = min(t10_m / 50.0, 1.0)
+                base_score = t10_r * award_mult * sample_w
+                sp = save_poty_by_pid.get(pid)
+                candidates.append(
+                    {
+                        "playerId": pid,
+                        "name": p.get("name", ""),
+                        "teamId": cur_tid,
+                        "teamName": cur_tname,
+                        "age": p.get("age", 0),
+                        "nationName": NATIONS.get(p.get("nation", 0), ""),
+                        "avgSkill": _player_avg_skill(p),
+                        "t10Rating": round(t10_r, 4),
+                        "t10Matches": t10_m,
+                        "sampleWeight": round(sample_w, 4),
+                        "overallRating": round(all_r, 4),
+                        "overallMatches": all_m,
+                        "mvps": mvps,
+                        "evps": evps,
+                        "awardMult": round(award_mult, 4),
+                        "baseScore": round(base_score, 6),
+                        "votedScore": round(base_score * 1.1, 6),
+                        "actualTop20": actual_top20,
+                        "saveRating": sp["rating"] if sp else None,
+                        "saveScore": sp["score"] if sp else None,
+                        "saveVoted": sp["voted"] if sp else False,
+                    }
+                )
+            elif all_m >= 10:
+                reason = "0 MVPs/EVPs this year (fails award gate)" if (mvps + evps) == 0 else "0 matches vs Top 10 teams (fails opponent gate)"
+                snubbed_pool.append(
+                    {
+                        "playerId": pid,
+                        "name": p.get("name", ""),
+                        "teamId": cur_tid,
+                        "teamName": cur_tname,
+                        "overallRating": round(all_r, 4),
+                        "overallMatches": all_m,
+                        "t10Rating": round(t10_r, 4),
+                        "t10Matches": t10_m,
+                        "mvps": mvps,
+                        "evps": evps,
+                        "baseScore": 0.0,
+                        "reason": reason,
+                    }
+                )
+
+        # Sort eligible candidates exactly like CheckForPlayerOfTheYearEvents (descending score)
+        candidates.sort(key=lambda r: (-r["baseScore"], -r["t10Rating"], r["playerId"]))
+        for idx, cand in enumerate(candidates, start=1):
+            cand["baseRank"] = idx
+            cand["inGameTop20"] = idx <= 20
+            cand["cstvBallotRank"] = None
+
+        # CSTV voting UI (ShowCstvVoting) takes the Top 20 by score, sorts by vs-Top-10 rating, and lists top 13
+        top20_by_rating = sorted(candidates[:20], key=lambda r: (-r["t10Rating"], r["baseRank"]))
+        for v_idx, cand in enumerate(top20_by_rating[:13], start=1):
+            cand["cstvBallotRank"] = v_idx
+
+        # Also add #21+ high-rated candidates hurt by <50 Top-10 match penalty or low awards into snubbed watchlist
+        for cand in candidates[20:]:
+            if cand["overallMatches"] < 10:
+                continue
+            if cand["t10Matches"] < 50:
+                reason = f"Sample penalty: {cand['t10Matches']}/50 vs Top 10 ({cand['sampleWeight']:.2f}x)"
+            else:
+                reason = f"Outside Top 20 cut (base rank #{cand['baseRank']})"
+            snubbed_pool.append(
+                {
+                    "playerId": cand["playerId"],
+                    "name": cand["name"],
+                    "teamId": cand["teamId"],
+                    "teamName": cand["teamName"],
+                    "overallRating": cand["overallRating"],
+                    "overallMatches": cand["overallMatches"],
+                    "t10Rating": cand["t10Rating"],
+                    "t10Matches": cand["t10Matches"],
+                    "mvps": cand["mvps"],
+                    "evps": cand["evps"],
+                    "baseScore": cand["baseScore"],
+                    "reason": reason,
+                }
+            )
+
+        snubbed_pool.sort(key=lambda r: (-r["overallRating"], -r["overallMatches"], r["playerId"]))
+
+        return {
+            "year": pred_year,
+            "saveDate": cur_dt,
+            "hasDec23Snapshot": bool(save_poty_by_pid),
+            "saveVotePlayerId": save_vote_pid,
+            "finalized": finalized,
+            "eligibleCount": len(candidates),
+            "candidates": candidates[:40],
+            "snubbed": snubbed_pool[:15],
+        }
+
+    def get_stats_overview(self, year: int | None = None, team_id: int | None = None, min_maps: int = 0) -> dict[str, Any]:
+        """Compute comprehensive player, team, map, award, and match statistics."""
+        if self.data is None:
+            return {"loaded": False}
+
+        tmpl_names, tourn_by_id, map_names = self._stats_lookups()
+        years_set: set[int] = set()
+
+        # 1. Career stats aggregation (rating, official matches W/L)
+        pcs_agg: dict[int, dict[str, Any]] = {}
+        for row in self.data.get("playerCareerStats", {}).get("playerCareerStats", []):
+            ryear = int(row.get("year", 0))
+            if ryear:
+                years_set.add(ryear)
+            if year is not None and ryear != year:
+                continue
+            if team_id is not None and row.get("teamId") != team_id:
+                continue
+            rp = int(row.get("roundsPlayed", 0))
+            mw = int(row.get("matchesWon", 0))
+            ml = int(row.get("matchesLost", 0))
+            if rp == 0 and mw == 0 and ml == 0:
+                continue
+            pid = int(row.get("playerId", 0))
+            entry = pcs_agg.setdefault(
+                pid,
+                {
+                    "matchesWon": 0,
+                    "matchesLost": 0,
+                    "accRating": 0.0,
+                    "rounds": 0,
+                    "kills": 0,
+                    "assists": 0,
+                    "deaths": 0,
+                    "damage": 0,
+                    "ok": 0,
+                    "od": 0,
+                },
+            )
+            entry["matchesWon"] += mw
+            entry["matchesLost"] += ml
+            entry["accRating"] += float(row.get("accumulativeRating", 0.0))
+            entry["rounds"] += rp
+            entry["kills"] += int(row.get("accumulatedKills", 0))
+            entry["assists"] += int(row.get("accumulatedAssists", 0))
+            entry["deaths"] += int(row.get("accumulateDeaths", 0))
+            entry["damage"] += int(row.get("accumulatedDamage", 0))
+            entry["ok"] += int(row.get("accumulatedOpeningKills", 0))
+            entry["od"] += int(row.get("accumulatedOpeningDeaths", 0))
+
+        # 2. Played matches & map-level micro-stats
+        p_map_agg: dict[int, dict[str, int]] = {}
+        t_agg: dict[int, dict[str, int]] = {}
+        m_agg: dict[int, dict[str, int]] = {
+            mid: {"mapId": mid, "name": mname, "played": 0, "rounds": 0, "otMaps": 0, "picks": 0, "bans": 0, "kills": 0, "aces": 0}
+            for mid, mname in map_names.items()
+        }
+        recent_matches: list[dict[str, Any]] = []
+        total_matches = 0
+        total_maps = 0
+        total_rounds = 0
+        total_kills = 0
+        total_k2 = total_k3 = total_k4 = total_k5 = 0
+        total_clutches = 0
+
+        for m in self.data.get("matches", {}).get("matches", []):
+            match_maps = [mm for mm in m.get("matchMaps", []) if mm.get("baseMatchRounds")]
+            if not match_maps:
+                continue
+            dt_obj = m.get("datetime", {})
+            myear = int(dt_obj.get("year", 0))
+            if myear:
+                years_set.add(myear)
+            if year is not None and myear != year:
+                continue
+
+            t1 = int(m.get("team1Id", 0))
+            t2 = int(m.get("team2Id", 0))
+            if team_id is not None and team_id not in (t1, t2):
+                continue
+
+            total_matches += 1
+            for mp in m.get("mapPicks", []):
+                mid = int(mp.get("mapId", 0))
+                if mid in m_agg:
+                    if mp.get("picked"):
+                        m_agg[mid]["picks"] += 1
+                    else:
+                        m_agg[mid]["bans"] += 1
+
+            t1_maps = 0
+            t2_maps = 0
+            t1_pids = set(m.get("team1PlayerIds", []))
+            t2_pids = set(m.get("team2PlayerIds", []))
+            map_score_strs: list[str] = []
+
+            for mm in match_maps:
+                rounds = mm.get("baseMatchRounds", [])
+                r_cnt = len(rounds)
+                if r_cnt == 0:
+                    continue
+                total_maps += 1
+                total_rounds += r_cnt
+                mid = int(mm.get("mapId", 0))
+
+                t1_r = sum(1 for r in rounds if r.get("winner") == t1)
+                t2_r = sum(1 for r in rounds if r.get("winner") == t2)
+                if t1_r > t2_r:
+                    t1_maps += 1
+                    t1_won_map = True
+                else:
+                    t2_maps += 1
+                    t1_won_map = False
+                map_score_strs.append(f"{map_names.get(mid, f'Map {mid}')} {t1_r}-{t2_r}")
+
+                # Pistol rounds (1 and 13 in MR12)
+                t1_pistols_w = sum(1 for r in rounds if r.get("number") in (1, 13) and r.get("winner") == t1)
+                t2_pistols_w = sum(1 for r in rounds if r.get("number") in (1, 13) and r.get("winner") == t2)
+                pistols_cnt = sum(1 for r in rounds if r.get("number") in (1, 13))
+
+                t1_cw = int(mm.get("team1ClutchesWon", 0))
+                t2_cw = int(mm.get("team2ClutchesWon", 0))
+                total_clutches += t1_cw + t2_cw
+
+                for tid_x, mw_x, ml_x, pw_x, cw_x, sv_x, fb_x in (
+                    (t1, 1 if t1_won_map else 0, 0 if t1_won_map else 1, t1_pistols_w, t1_cw, int(mm.get("team1Saves", 0)), int(mm.get("team1Fullbuys", 0))),
+                    (t2, 0 if t1_won_map else 1, 1 if t1_won_map else 0, t2_pistols_w, t2_cw, int(mm.get("team2Saves", 0)), int(mm.get("team2Fullbuys", 0))),
+                ):
+                    if tid_x:
+                        ta = t_agg.setdefault(
+                            tid_x,
+                            {"matchesWon": 0, "matchesLost": 0, "mapsWon": 0, "mapsLost": 0, "roundsPlayed": 0, "pistolsWon": 0, "pistolsPlayed": 0, "clutchesWon": 0, "saves": 0, "fullbuys": 0},
+                        )
+                        ta["mapsWon"] += mw_x
+                        ta["mapsLost"] += ml_x
+                        ta["roundsPlayed"] += r_cnt
+                        ta["pistolsWon"] += pw_x
+                        ta["pistolsPlayed"] += pistols_cnt
+                        ta["clutchesWon"] += cw_x
+                        ta["saves"] += sv_x
+                        ta["fullbuys"] += fb_x
+
+                if mid in m_agg:
+                    m_agg[mid]["played"] += 1
+                    m_agg[mid]["rounds"] += r_cnt
+                    if r_cnt > 24:
+                        m_agg[mid]["otMaps"] += 1
+
+                for ps_raw in mm.get("playerStats", []):
+                    ps = self._parse_map_player_stat(ps_raw)
+                    pid = ps["playerId"]
+                    if not pid:
+                        continue
+                    if team_id is not None:
+                        if team_id == t1 and pid not in t1_pids:
+                            continue
+                        if team_id == t2 and pid not in t2_pids:
+                            continue
+                    pa = p_map_agg.setdefault(
+                        pid,
+                        {
+                            "mapsPlayed": 0,
+                            "mapsWon": 0,
+                            "rounds": 0,
+                            "kills": 0,
+                            "assists": 0,
+                            "flashAssists": 0,
+                            "deaths": 0,
+                            "damage": 0,
+                            "hsKills": 0,
+                            "k2": 0,
+                            "k3": 0,
+                            "k4": 0,
+                            "k5": 0,
+                            "openingKills": 0,
+                            "openingDeaths": 0,
+                            "sniperKills": 0,
+                            "clutchKills": 0,
+                        },
+                    )
+                    pa["mapsPlayed"] += 1
+                    won_this_map = (pid in t1_pids and t1_won_map) or (pid in t2_pids and not t1_won_map)
+                    if won_this_map:
+                        pa["mapsWon"] += 1
+                    pa["rounds"] += r_cnt
+                    for k_stat in ("kills", "assists", "flashAssists", "deaths", "damage", "hsKills", "k2", "k3", "k4", "k5", "openingKills", "openingDeaths", "sniperKills", "clutchKills"):
+                        pa[k_stat] += ps[k_stat]
+                    total_kills += ps["kills"]
+                    total_k2 += ps["k2"]
+                    total_k3 += ps["k3"]
+                    total_k4 += ps["k4"]
+                    total_k5 += ps["k5"]
+                    if mid in m_agg:
+                        m_agg[mid]["kills"] += ps["kills"]
+                        m_agg[mid]["aces"] += ps["k5"]
+
+            if t1:
+                t1a = t_agg.setdefault(t1, {"matchesWon": 0, "matchesLost": 0, "mapsWon": 0, "mapsLost": 0, "roundsPlayed": 0, "pistolsWon": 0, "pistolsPlayed": 0, "clutchesWon": 0, "saves": 0, "fullbuys": 0})
+                if t1_maps > t2_maps:
+                    t1a["matchesWon"] += 1
+                else:
+                    t1a["matchesLost"] += 1
+            if t2:
+                t2a = t_agg.setdefault(t2, {"matchesWon": 0, "matchesLost": 0, "mapsWon": 0, "mapsLost": 0, "roundsPlayed": 0, "pistolsWon": 0, "pistolsPlayed": 0, "clutchesWon": 0, "saves": 0, "fullbuys": 0})
+                if t2_maps > t1_maps:
+                    t2a["matchesWon"] += 1
+                else:
+                    t2a["matchesLost"] += 1
+
+            tourn_obj = tourn_by_id.get(m.get("tournamentId"), {})
+            recent_matches.append(
+                {
+                    "id": m["id"],
+                    "datetime": dt_obj,
+                    "sortKey": self._match_date_key(dt_obj),
+                    "tournamentName": tourn_obj.get("name", f"Tournament #{m.get('tournamentId')}"),
+                    "team1Id": t1,
+                    "team1Name": self.teams_by_id.get(t1, {}).get("name", f"Team {t1}"),
+                    "team2Id": t2,
+                    "team2Name": self.teams_by_id.get(t2, {}).get("name", f"Team {t2}"),
+                    "team1Maps": t1_maps,
+                    "team2Maps": t2_maps,
+                    "winnerTeamId": t1 if t1_maps > t2_maps else t2,
+                    "bo": m.get("numberOfMaps", len(match_maps)),
+                    "scoresSummary": ", ".join(map_score_strs),
+                    "team1RankBefore": m.get("team1RankBefore", 0),
+                    "team2RankBefore": m.get("team2RankBefore", 0),
+                }
+            )
+
+        recent_matches.sort(key=lambda x: x["sortKey"], reverse=True)
+        for rm in recent_matches:
+            rm.pop("sortKey", None)
+
+        # 3. Awards & Tournament Hall of Fame
+        # PlayerAward.Type enum from game assembly: 0=mvp, 1=win (event trophy), 2=evp, 3=top20
+        total_mvps = total_wins = total_evps = 0
+        player_awards_summary: dict[int, dict[str, int]] = {}
+        awards_feed: list[dict[str, Any]] = []
+        for p in self.data["players"]["players"]:
+            pid = p["id"]
+            aws = p.get("playerAwards", [])
+            if not aws:
+                continue
+            mv = wn = ev = t20 = 0
+            for a in aws:
+                ayear = int(a.get("year", 0))
+                tmpl_id = int(a.get("tournamentTemplate", -1))
+                # Skip pre-career mock/dev awards (e.g. ZywOo year=7, tournamentTemplate=-1)
+                if ayear < 2000 or (tmpl_id < 0 and a.get("type") != 3):
+                    continue
+                if year is not None and ayear != year:
+                    continue
+                atype = int(a.get("type", 0))
+                if atype == 0:
+                    mv += 1
+                    total_mvps += 1
+                elif atype == 1:
+                    wn += 1
+                    total_wins += 1
+                elif atype == 2:
+                    ev += 1
+                    total_evps += 1
+                elif atype == 3:
+                    t20 = int(a.get("top20Placement", 0)) or t20
+                tid_a = a.get("teamId", 0)
+                awards_feed.append(
+                    {
+                        "playerId": pid,
+                        "playerName": p.get("name", ""),
+                        "teamName": self.teams_by_id.get(tid_a, {}).get("name", ""),
+                        "type": atype,
+                        "typeLabel": {0: "MVP", 1: "Event Win", 2: "EVP", 3: f"Top 20 (#{a.get('top20Placement', '')})"}.get(atype, f"Award {atype}"),
+                        "tournamentName": tmpl_names.get(tmpl_id, f"Event #{tmpl_id}") if atype != 3 else "HLTV Yearly Top 20",
+                        "year": ayear,
+                        "month": int(a.get("month", 0)),
+                    }
+                )
+            player_awards_summary[pid] = {"mvps": mv, "wins": wn, "evps": ev, "top20": t20}
+        awards_feed.sort(key=lambda x: (-x["year"], -x["month"], x["type"], x["playerName"]))
+
+        # 4. Build Player Leaderboard
+        all_pids = set(pcs_agg.keys()) | set(p_map_agg.keys())
+        player_rows: list[dict[str, Any]] = []
+        for pid in all_pids:
+            p = self.players_by_id.get(pid)
+            if not p:
+                continue
+            c = self.player_contract_by_pid.get(pid)
+            cur_tid = c["teamId"] if c else 0
+            cur_tname = self.teams_by_id[cur_tid]["name"] if cur_tid in self.teams_by_id else "Free Agent"
+
+            pcs = pcs_agg.get(pid, {})
+            pm = p_map_agg.get(pid, {})
+            maps_played = pm.get("mapsPlayed", 0)
+            if maps_played < min_maps:
+                continue
+
+            mw = pcs.get("matchesWon", 0)
+            ml = pcs.get("matchesLost", 0)
+            matches_cnt = mw + ml
+            rating = round(pcs["accRating"] / matches_cnt, 3) if matches_cnt > 0 else 0.0
+
+            # Use map_agg for rounds/K/A/D/dmg (exact & includes flash/HS/clutches/AWP/multikills), fallback to pcs
+            rounds = pm.get("rounds") or pcs.get("rounds", 0)
+            kills = pm.get("kills") if pm else pcs.get("kills", 0)
+            deaths = pm.get("deaths") if pm else pcs.get("deaths", 0)
+            assists = pm.get("assists") if pm else pcs.get("assists", 0)
+            damage = pm.get("damage") if pm else pcs.get("damage", 0)
+            ok = pm.get("openingKills") if pm else pcs.get("ok", 0)
+            od = pm.get("openingDeaths") if pm else pcs.get("od", 0)
+            hs = pm.get("hsKills", 0)
+            awp_k = pm.get("sniperKills", 0)
+            clutches = pm.get("clutchKills", 0)
+            flash_a = pm.get("flashAssists", 0)
+            k2 = pm.get("k2", 0)
+            k3 = pm.get("k3", 0)
+            k4 = pm.get("k4", 0)
+            k5 = pm.get("k5", 0)
+            aw = player_awards_summary.get(pid, {})
+
+            player_rows.append(
+                {
+                    "playerId": pid,
+                    "name": p.get("name", ""),
+                    "age": p.get("age", 0),
+                    "nationName": NATIONS.get(p.get("nation", 0), ""),
+                    "teamId": cur_tid,
+                    "teamName": cur_tname,
+                    "avgSkill": _player_avg_skill(p),
+                    "reputation": p.get("reputation", 1),
+                    "rating": rating,
+                    "matches": matches_cnt,
+                    "matchesWon": mw,
+                    "matchesLost": ml,
+                    "winPct": round(mw * 100.0 / matches_cnt, 1) if matches_cnt else 0.0,
+                    "mapsPlayed": maps_played,
+                    "mapsWon": pm.get("mapsWon", 0),
+                    "rounds": rounds,
+                    "kills": kills,
+                    "assists": assists,
+                    "flashAssists": flash_a,
+                    "deaths": deaths,
+                    "kd": round(kills / max(deaths, 1), 2),
+                    "kDiff": kills - deaths,
+                    "kpr": round(kills / rounds, 2) if rounds else 0.0,
+                    "dpr": round(deaths / rounds, 2) if rounds else 0.0,
+                    "adr": round(damage / rounds, 1) if rounds else 0.0,
+                    "hsPct": round(hs * 100.0 / kills, 1) if kills else 0.0,
+                    "openingKills": ok,
+                    "openingDeaths": od,
+                    "openingDiff": ok - od,
+                    "openingPct": round(ok * 100.0 / (ok + od), 1) if (ok + od) else 0.0,
+                    "sniperKills": awp_k,
+                    "clutchKills": clutches,
+                    "k2": k2,
+                    "k3": k3,
+                    "k4": k4,
+                    "k5": k5,
+                    "mvps": aw.get("mvps", 0),
+                    "evps": aw.get("evps", 0),
+                    "wins": aw.get("wins", 0),
+                    "top20": aw.get("top20", 0),
+                }
+            )
+
+        player_rows.sort(key=lambda r: (-r["rating"], -r["kd"], -r["kills"]))
+
+        # 5. Team Standings & Tournament Hall of Fame
+        team_rows: list[dict[str, Any]] = []
+        hall_of_fame: list[dict[str, Any]] = []
+        total_prize_pool = 0
+        for t in self.data["teams"]["teams"]:
+            tid = t["id"]
+            if team_id is not None and tid != team_id:
+                continue
+            rank_pts = 0
+            titles = 0
+            top4 = 0
+            prize_won = 0
+            for rp in t.get("rankingPoints", []):
+                r_yr = int(rp.get("dateGranted", {}).get("year", 0))
+                rank_pts += int(rp.get("currentPoints", 0))
+                if year is not None and r_yr != year:
+                    continue
+                pmoney = int(rp.get("prizeMoney", 0))
+                prize_won += pmoney
+                total_prize_pool += pmoney
+                place = int(rp.get("tournamentPlacement", 0))
+                if place == 1:
+                    titles += 1
+                    hall_of_fame.append(
+                        {
+                            "teamId": tid,
+                            "teamName": t.get("name", ""),
+                            "tournamentName": tmpl_names.get(rp.get("tournamentTemplate"), f"Event #{rp.get('tournamentTemplate')}"),
+                            "prizeMoney": pmoney,
+                            "points": int(rp.get("originalPoints", 0)),
+                            "datetime": rp.get("dateGranted", {}),
+                            "sortKey": self._match_date_key(rp.get("dateGranted", {})),
+                        }
+                    )
+                if 1 <= place <= 4:
+                    top4 += 1
+
+            pcs_t = self.get_team_player_contracts(tid)
+            active_players = [self.players_by_id[c["playerId"]] for c in pcs_t if not c.get("benched") and c["playerId"] in self.players_by_id]
+            avg_roster_skill = round(sum(_player_avg_skill(p) for p in active_players) / len(active_players), 2) if active_players else 0.0
+            avg_roster_age = round(sum(p.get("age", 20) for p in active_players) / len(active_players), 1) if active_players else 0.0
+
+            ta = t_agg.get(tid, {})
+            mw_t = ta.get("matchesWon", 0)
+            ml_t = ta.get("matchesLost", 0)
+            m_tot = mw_t + ml_t
+            map_w = ta.get("mapsWon", 0)
+            map_l = ta.get("mapsLost", 0)
+            map_tot = map_w + map_l
+            pw_t = ta.get("pistolsWon", 0)
+            pp_t = ta.get("pistolsPlayed", 0)
+
+            rhist = t.get("rankingHistory", [])
+            cur_rank = rhist[-1] if rhist else 0
+            rank_delta = (rhist[-2] - cur_rank) if len(rhist) >= 2 and rhist[-2] > 0 and cur_rank > 0 else 0
+
+            team_rows.append(
+                {
+                    "teamId": tid,
+                    "name": t.get("name", ""),
+                    "nationName": NATIONS.get(t.get("nation", 0), ""),
+                    "reputation": t.get("reputation", 1),
+                    "worldRank": cur_rank,
+                    "rankDelta": rank_delta,
+                    "rankingPoints": rank_pts,
+                    "avgSkill": avg_roster_skill,
+                    "avgAge": avg_roster_age,
+                    "matches": m_tot,
+                    "matchesWon": mw_t,
+                    "matchesLost": ml_t,
+                    "matchWinPct": round(mw_t * 100.0 / m_tot, 1) if m_tot else 0.0,
+                    "maps": map_tot,
+                    "mapsWon": map_w,
+                    "mapsLost": map_l,
+                    "mapWinPct": round(map_w * 100.0 / map_tot, 1) if map_tot else 0.0,
+                    "pistolWinPct": round(pw_t * 100.0 / pp_t, 1) if pp_t else 0.0,
+                    "clutchesWon": ta.get("clutchesWon", 0),
+                    "titles": titles,
+                    "top4": top4,
+                    "prizeWon": prize_won,
+                    "balance": t.get("teamFinances", {}).get("currentBalance", 0),
+                }
+            )
+
+        team_rows.sort(key=lambda r: (r["worldRank"] == 0, r["worldRank"] if r["worldRank"] > 0 else 9999, -r["rankingPoints"]))
+        hall_of_fame.sort(key=lambda x: x["sortKey"], reverse=True)
+        for h in hall_of_fame:
+            h.pop("sortKey", None)
+
+        map_rows = []
+        for mr in m_agg.values():
+            played = mr["played"]
+            map_rows.append(
+                {
+                    **mr,
+                    "avgRounds": round(mr["rounds"] / played, 1) if played else 0.0,
+                    "otPct": round(mr["otMaps"] * 100.0 / played, 1) if played else 0.0,
+                }
+            )
+        map_rows.sort(key=lambda r: -r["played"])
+
+        cur_save_year = int((self.data.get("datetime", {}) or {}).get("year", 0) or 0)
+        pred_year = year if year is not None else (cur_save_year or (max(years_set) if years_set else 0))
+        top20_prediction = self._compute_top20_prediction(pred_year) if pred_year else {"year": 0, "candidates": [], "snubbed": []}
+        if year is None and not top20_prediction.get("candidates") and years_set:
+            latest_data_year = max(years_set)
+            if latest_data_year != pred_year:
+                top20_prediction = self._compute_top20_prediction(latest_data_year)
+
+        return {
+            "loaded": True,
+            "years": sorted(years_set, reverse=True),
+            "totals": {
+                "matchesPlayed": total_matches,
+                "mapsPlayed": total_maps,
+                "roundsPlayed": total_rounds,
+                "kills": total_kills,
+                "aces": total_k5,
+                "quads": total_k4,
+                "triples": total_k3,
+                "doubles": total_k2,
+                "clutches": total_clutches,
+                "mvps": total_mvps,
+                "evps": total_evps,
+                "wins": total_wins,
+                "titlesAwarded": len(hall_of_fame),
+                "totalPrizePool": total_prize_pool,
+            },
+            "players": player_rows,
+            "teams": team_rows,
+            "maps": map_rows,
+            "recentMatches": recent_matches[:120],
+            "hallOfFame": hall_of_fame[:80],
+            "awardsFeed": awards_feed[:120],
+            "top20Prediction": top20_prediction,
+        }
+
+    def get_player_stats_detail(self, player_id: int) -> dict[str, Any]:
+        """Deep career, map, event, skill-growth, victim, and match breakdown for a player."""
+        assert self.data is not None
+        p = self.players_by_id.get(player_id)
+        if not p:
+            raise ValueError(f"Player {player_id} not found.")
+        tmpl_names, tourn_by_id, map_names = self._stats_lookups()
+        c = self.player_contract_by_pid.get(player_id)
+        cur_tid = c["teamId"] if c else 0
+
+        # 1. Career rows by team + event + year
+        event_rows = []
+        tot = {"mw": 0, "ml": 0, "accRating": 0.0, "rounds": 0, "kills": 0, "assists": 0, "deaths": 0, "damage": 0, "ok": 0, "od": 0}
+        for row in self.data.get("playerCareerStats", {}).get("playerCareerStats", []):
+            if row.get("playerId") != player_id:
+                continue
+            rp = int(row.get("roundsPlayed", 0))
+            mw = int(row.get("matchesWon", 0))
+            ml = int(row.get("matchesLost", 0))
+            if rp == 0 and mw == 0 and ml == 0:
+                continue
+            cnt = mw + ml
+            tid_r = int(row.get("teamId", 0))
+            tmpl = int(row.get("tournamentTemplate", 0))
+            event_rows.append(
+                {
+                    "year": row.get("year", 0),
+                    "month": row.get("month", 0),
+                    "teamName": self.teams_by_id.get(tid_r, {}).get("name", f"Team {tid_r}"),
+                    "tournamentName": tmpl_names.get(tmpl, f"Event #{tmpl}"),
+                    "matchesWon": mw,
+                    "matchesLost": ml,
+                    "rating": round(float(row.get("accumulativeRating", 0.0)) / cnt, 2) if cnt else 0.0,
+                    "rounds": rp,
+                    "kills": int(row.get("accumulatedKills", 0)),
+                    "assists": int(row.get("accumulatedAssists", 0)),
+                    "deaths": int(row.get("accumulateDeaths", 0)),
+                    "adr": round(int(row.get("accumulatedDamage", 0)) / rp, 1) if rp else 0.0,
+                    "openingDiff": int(row.get("accumulatedOpeningKills", 0)) - int(row.get("accumulatedOpeningDeaths", 0)),
+                }
+            )
+            tot["mw"] += mw
+            tot["ml"] += ml
+            tot["accRating"] += float(row.get("accumulativeRating", 0.0))
+            tot["rounds"] += rp
+            tot["kills"] += int(row.get("accumulatedKills", 0))
+            tot["assists"] += int(row.get("accumulatedAssists", 0))
+            tot["deaths"] += int(row.get("accumulateDeaths", 0))
+            tot["damage"] += int(row.get("accumulatedDamage", 0))
+            tot["ok"] += int(row.get("accumulatedOpeningKills", 0))
+            tot["od"] += int(row.get("accumulatedOpeningDeaths", 0))
+        event_rows.sort(key=lambda r: (r["year"], r["month"]), reverse=True)
+
+        # 2. Match & Map breakdown + Victims matrix
+        by_map: dict[int, dict[str, int]] = {}
+        victims: dict[int, int] = {}
+        recent_maps: list[dict[str, Any]] = []
+        micro_tot = {"maps": 0, "mapsWon": 0, "rounds": 0, "kills": 0, "assists": 0, "flashAssists": 0, "deaths": 0, "damage": 0, "hsKills": 0, "k2": 0, "k3": 0, "k4": 0, "k5": 0, "openingKills": 0, "openingDeaths": 0, "sniperKills": 0, "clutchKills": 0}
+
+        for m in self.data.get("matches", {}).get("matches", []):
+            t1_pids = set(m.get("team1PlayerIds", []))
+            t2_pids = set(m.get("team2PlayerIds", []))
+            if player_id not in t1_pids and player_id not in t2_pids:
+                continue
+            t1 = int(m.get("team1Id", 0))
+            t2 = int(m.get("team2Id", 0))
+            is_t1 = player_id in t1_pids
+            opp_tid = t2 if is_t1 else t1
+            opp_name = self.teams_by_id.get(opp_tid, {}).get("name", f"Team {opp_tid}")
+            tourn_name = tourn_by_id.get(m.get("tournamentId"), {}).get("name", "")
+            dt_obj = m.get("datetime", {})
+
+            for mm in m.get("matchMaps", []):
+                rounds = mm.get("baseMatchRounds", [])
+                r_cnt = len(rounds)
+                if r_cnt == 0:
+                    continue
+                ps_raw = next((x for x in mm.get("playerStats", []) if x.get("data") and x["data"][0] == player_id), None)
+                if not ps_raw:
+                    continue
+                ps = self._parse_map_player_stat(ps_raw)
+                t1_r = sum(1 for r in rounds if r.get("winner") == t1)
+                t2_r = sum(1 for r in rounds if r.get("winner") == t2)
+                won = (t1_r > t2_r) if is_t1 else (t2_r > t1_r)
+                mid = int(mm.get("mapId", 0))
+
+                for mk in ps_raw.get("matrixKills", []):
+                    md = mk.get("data", [])
+                    if len(md) >= 2 and int(md[1]) > 0:
+                        opp_pid = int(md[0])
+                        victims[opp_pid] = victims.get(opp_pid, 0) + int(md[1])
+
+                micro_tot["maps"] += 1
+                if won:
+                    micro_tot["mapsWon"] += 1
+                micro_tot["rounds"] += r_cnt
+                for k_stat in ("kills", "assists", "flashAssists", "deaths", "damage", "hsKills", "k2", "k3", "k4", "k5", "openingKills", "openingDeaths", "sniperKills", "clutchKills"):
+                    micro_tot[k_stat] += ps[k_stat]
+
+                bm = by_map.setdefault(mid, {"mapId": mid, "mapName": map_names.get(mid, f"Map {mid}"), "maps": 0, "wins": 0, "rounds": 0, "kills": 0, "deaths": 0, "damage": 0, "hsKills": 0, "sniperKills": 0, "clutchKills": 0, "aces": 0})
+                bm["maps"] += 1
+                if won:
+                    bm["wins"] += 1
+                bm["rounds"] += r_cnt
+                bm["kills"] += ps["kills"]
+                bm["deaths"] += ps["deaths"]
+                bm["damage"] += ps["damage"]
+                bm["hsKills"] += ps["hsKills"]
+                bm["sniperKills"] += ps["sniperKills"]
+                bm["clutchKills"] += ps["clutchKills"]
+                bm["aces"] += ps["k5"]
+
+                recent_maps.append(
+                    {
+                        "matchId": m["id"],
+                        "datetime": dt_obj,
+                        "sortKey": self._match_date_key(dt_obj),
+                        "tournamentName": tourn_name,
+                        "opponentName": opp_name,
+                        "mapName": map_names.get(mid, f"Map {mid}"),
+                        "score": f"{t1_r if is_t1 else t2_r}-{t2_r if is_t1 else t1_r}",
+                        "won": won,
+                        "kills": ps["kills"],
+                        "assists": ps["assists"],
+                        "deaths": ps["deaths"],
+                        "adr": round(ps["damage"] / r_cnt, 1),
+                        "hsPct": round(ps["hsKills"] * 100.0 / ps["kills"], 1) if ps["kills"] else 0.0,
+                        "sniperKills": ps["sniperKills"],
+                        "clutchKills": ps["clutchKills"],
+                        "k2": ps["k2"],
+                        "k3": ps["k3"],
+                        "k4": ps["k4"],
+                        "k5": ps["k5"],
+                    }
+                )
+
+        recent_maps.sort(key=lambda x: x["sortKey"], reverse=True)
+        for rm in recent_maps:
+            rm.pop("sortKey", None)
+
+        map_breakdown = []
+        for bm in by_map.values():
+            map_breakdown.append(
+                {
+                    **bm,
+                    "winPct": round(bm["wins"] * 100.0 / bm["maps"], 1) if bm["maps"] else 0.0,
+                    "kd": round(bm["kills"] / max(bm["deaths"], 1), 2),
+                    "adr": round(bm["damage"] / bm["rounds"], 1) if bm["rounds"] else 0.0,
+                    "hsPct": round(bm["hsKills"] * 100.0 / bm["kills"], 1) if bm["kills"] else 0.0,
+                }
+            )
+        map_breakdown.sort(key=lambda x: -x["maps"])
+
+        # 3. Skill progression from playerSkillHistories
+        hist_by_skill: dict[int, list[tuple[int, int, float]]] = {}
+        for h in self.data.get("playerSkillHistories", {}).get("playerSkillHistories", []):
+            if h.get("playerId") == player_id:
+                sid = int(h.get("skillId", 0))
+                hist_by_skill.setdefault(sid, []).append((int(h.get("year", 0)), int(h.get("month", 0)), float(h.get("skillLevel", 0.0))))
+
+        skill_progression = []
+        for sk in PLAYER_SKILLS:
+            cur_val = float(p.get("skills", {}).get(sk["key"], 0.0))
+            pts = sorted(hist_by_skill.get(sk["id"], []))
+            first_val = pts[0][2] if pts else cur_val
+            skill_progression.append(
+                {
+                    "id": sk["id"],
+                    "label": sk["label"],
+                    "group": sk["group"],
+                    "start": round(first_val, 2),
+                    "current": round(cur_val, 2),
+                    "delta": round(cur_val - first_val, 2),
+                }
+            )
+
+        top_victims = [
+            {"playerId": vid, "name": self.players_by_id.get(vid, {}).get("name", f"Player #{vid}"), "kills": kcnt}
+            for vid, kcnt in sorted(victims.items(), key=lambda x: -x[1])[:10]
+        ]
+
+        awards = []
+        for a in p.get("playerAwards", []):
+            ayear = int(a.get("year", 0))
+            tmpl_id = int(a.get("tournamentTemplate", -1))
+            if ayear < 2000 or (tmpl_id < 0 and a.get("type") != 3):
+                continue
+            atype = int(a.get("type", 0))
+            awards.append(
+                {
+                    "type": atype,
+                    "typeLabel": {0: "MVP", 1: "Event Win", 2: "EVP", 3: f"Top 20 (#{a.get('top20Placement', '')})"}.get(atype, "Award"),
+                    "tournamentName": tmpl_names.get(tmpl_id, f"Event #{tmpl_id}") if atype != 3 else "HLTV Yearly Top 20",
+                    "teamName": self.teams_by_id.get(a.get("teamId", 0), {}).get("name", ""),
+                    "year": ayear,
+                    "month": int(a.get("month", 0)),
+                }
+            )
+        awards.sort(key=lambda x: (-x["year"], -x["month"], x["type"]))
+
+        m_tot = tot["mw"] + tot["ml"]
+        return {
+            "player": {
+                "id": player_id,
+                "name": p.get("name", ""),
+                "age": p.get("age", 0),
+                "nationName": NATIONS.get(p.get("nation", 0), ""),
+                "teamName": self.teams_by_id[cur_tid]["name"] if cur_tid in self.teams_by_id else "Free Agent",
+                "avgSkill": _player_avg_skill(p),
+                "reputation": p.get("reputation", 1),
+            },
+            "career": {
+                "rating": round(tot["accRating"] / m_tot, 3) if m_tot else 0.0,
+                "matches": m_tot,
+                "matchesWon": tot["mw"],
+                "matchesLost": tot["ml"],
+                **micro_tot,
+                "kd": round(micro_tot["kills"] / max(micro_tot["deaths"], 1), 2) if micro_tot["maps"] else round(tot["kills"] / max(tot["deaths"], 1), 2),
+                "adr": round(micro_tot["damage"] / micro_tot["rounds"], 1) if micro_tot["rounds"] else (round(tot["damage"] / tot["rounds"], 1) if tot["rounds"] else 0.0),
+                "hsPct": round(micro_tot["hsKills"] * 100.0 / micro_tot["kills"], 1) if micro_tot["kills"] else 0.0,
+            },
+            "mapBreakdown": map_breakdown,
+            "eventBreakdown": event_rows,
+            "skillProgression": skill_progression,
+            "topVictims": top_victims,
+            "awards": awards,
+            "recentMaps": recent_maps[:25],
+        }
+
+    def get_team_stats_detail(self, team_id: int) -> dict[str, Any]:
+        """Detailed team performance, map pool, tournament history, and match history."""
+        assert self.data is not None
+        t = self.teams_by_id.get(team_id)
+        if not t:
+            raise ValueError(f"Team {team_id} not found.")
+        tmpl_names, tourn_by_id, map_names = self._stats_lookups()
+
+        map_pool: dict[int, dict[str, int]] = {
+            mid: {"mapId": mid, "mapName": mname, "played": 0, "won": 0, "lost": 0, "picked": 0, "banned": 0}
+            for mid, mname in map_names.items()
+        }
+        matches_list: list[dict[str, Any]] = []
+        mw = ml = map_w = map_l = pw = pp = cw = sv = fb = 0
+
+        for m in self.data.get("matches", {}).get("matches", []):
+            t1 = int(m.get("team1Id", 0))
+            t2 = int(m.get("team2Id", 0))
+            if team_id not in (t1, t2):
+                continue
+            match_maps = [mm for mm in m.get("matchMaps", []) if mm.get("baseMatchRounds")]
+            if not match_maps:
+                continue
+            is_t1 = team_id == t1
+            opp_id = t2 if is_t1 else t1
+            for mp in m.get("mapPicks", []):
+                if mp.get("choiceBy") == team_id and mp.get("mapId") in map_pool:
+                    if mp.get("picked"):
+                        map_pool[mp["mapId"]]["picked"] += 1
+                    else:
+                        map_pool[mp["mapId"]]["banned"] += 1
+
+            my_maps = 0
+            opp_maps = 0
+            score_strs = []
+            for mm in match_maps:
+                rounds = mm.get("baseMatchRounds", [])
+                r_cnt = len(rounds)
+                if not r_cnt:
+                    continue
+                t1_r = sum(1 for r in rounds if r.get("winner") == t1)
+                t2_r = sum(1 for r in rounds if r.get("winner") == t2)
+                my_r, opp_r = (t1_r, t2_r) if is_t1 else (t2_r, t1_r)
+                won_m = my_r > opp_r
+                if won_m:
+                    my_maps += 1
+                    map_w += 1
+                else:
+                    opp_maps += 1
+                    map_l += 1
+                mid = int(mm.get("mapId", 0))
+                score_strs.append(f"{map_names.get(mid, f'Map {mid}')} {my_r}-{opp_r}")
+                if mid in map_pool:
+                    map_pool[mid]["played"] += 1
+                    if won_m:
+                        map_pool[mid]["won"] += 1
+                    else:
+                        map_pool[mid]["lost"] += 1
+                pw += sum(1 for r in rounds if r.get("number") in (1, 13) and r.get("winner") == team_id)
+                pp += sum(1 for r in rounds if r.get("number") in (1, 13))
+                cw += int(mm.get("team1ClutchesWon" if is_t1 else "team2ClutchesWon", 0))
+                sv += int(mm.get("team1Saves" if is_t1 else "team2Saves", 0))
+                fb += int(mm.get("team1Fullbuys" if is_t1 else "team2Fullbuys", 0))
+
+            if my_maps > opp_maps:
+                mw += 1
+            else:
+                ml += 1
+
+            dt_obj = m.get("datetime", {})
+            matches_list.append(
+                {
+                    "id": m["id"],
+                    "datetime": dt_obj,
+                    "sortKey": self._match_date_key(dt_obj),
+                    "tournamentName": tourn_by_id.get(m.get("tournamentId"), {}).get("name", ""),
+                    "opponentId": opp_id,
+                    "opponentName": self.teams_by_id.get(opp_id, {}).get("name", f"Team {opp_id}"),
+                    "won": my_maps > opp_maps,
+                    "seriesScore": f"{my_maps}-{opp_maps}",
+                    "mapScores": ", ".join(score_strs),
+                    "pointsDelta": m.get("team1PointsDelta" if is_t1 else "team2PointsDelta", 0),
+                }
+            )
+
+        matches_list.sort(key=lambda x: x["sortKey"], reverse=True)
+        for ml_item in matches_list:
+            ml_item.pop("sortKey", None)
+
+        tourn_results = []
+        for rp in t.get("rankingPoints", []):
+            place = int(rp.get("tournamentPlacement", 0))
+            if place > 0:
+                tourn_results.append(
+                    {
+                        "tournamentName": tmpl_names.get(rp.get("tournamentTemplate"), f"Event #{rp.get('tournamentTemplate')}"),
+                        "placement": place,
+                        "prizeMoney": int(rp.get("prizeMoney", 0)),
+                        "points": int(rp.get("originalPoints", 0)),
+                        "datetime": rp.get("dateGranted", {}),
+                        "sortKey": self._match_date_key(rp.get("dateGranted", {})),
+                    }
+                )
+        tourn_results.sort(key=lambda x: x["sortKey"], reverse=True)
+        for tr in tourn_results:
+            tr.pop("sortKey", None)
+
+        map_pool_rows = [
+            {
+                **mp,
+                "winPct": round(mp["won"] * 100.0 / mp["played"], 1) if mp["played"] else 0.0,
+            }
+            for mp in map_pool.values()
+        ]
+        map_pool_rows.sort(key=lambda x: (-x["played"], -x["winPct"]))
+
+        return {
+            "team": {
+                "id": team_id,
+                "name": t.get("name", ""),
+                "nationName": NATIONS.get(t.get("nation", 0), ""),
+                "rankingHistory": t.get("rankingHistory", []),
+                "worldRank": (t.get("rankingHistory") or [0])[-1],
+                "rankingPoints": sum(int(rp.get("currentPoints", 0)) for rp in t.get("rankingPoints", [])),
+                "matchesWon": mw,
+                "matchesLost": ml,
+                "mapsWon": map_w,
+                "mapsLost": map_l,
+                "pistolWinPct": round(pw * 100.0 / pp, 1) if pp else 0.0,
+                "clutchesWon": cw,
+                "saves": sv,
+                "fullbuys": fb,
+                "prizeWon": sum(int(rp.get("prizeMoney", 0)) for rp in t.get("rankingPoints", [])),
+            },
+            "mapPool": map_pool_rows,
+            "tournaments": tourn_results[:30],
+            "recentMatches": matches_list[:35],
+        }
+
+    def get_match_stats_detail(self, match_id: int) -> dict[str, Any]:
+        """Return full veto and map-by-map 10-player scoreboards for a played match."""
+        assert self.data is not None
+        m = next((x for x in self.data.get("matches", {}).get("matches", []) if x.get("id") == match_id), None)
+        if not m:
+            raise ValueError(f"Match {match_id} not found.")
+        _, tourn_by_id, map_names = self._stats_lookups()
+
+        t1 = int(m.get("team1Id", 0))
+        t2 = int(m.get("team2Id", 0))
+        t1_name = self.teams_by_id.get(t1, {}).get("name", f"Team {t1}")
+        t2_name = self.teams_by_id.get(t2, {}).get("name", f"Team {t2}")
+        t1_pids = set(m.get("team1PlayerIds", []))
+        t2_pids = set(m.get("team2PlayerIds", []))
+
+        veto = [
+            {
+                "order": mp.get("order", 0),
+                "mapName": map_names.get(mp.get("mapId"), f"Map {mp.get('mapId')}"),
+                "picked": bool(mp.get("picked")),
+                "by": self.teams_by_id.get(mp.get("choiceBy", 0), {}).get("name", "Decider") if mp.get("choiceBy") else "Decider",
+            }
+            for mp in sorted(m.get("mapPicks", []), key=lambda x: x.get("order", 0))
+        ]
+
+        maps_out = []
+        t1_maps = t2_maps = 0
+        for mm in m.get("matchMaps", []):
+            rounds = mm.get("baseMatchRounds", [])
+            r_cnt = len(rounds)
+            if r_cnt == 0:
+                continue
+            t1_r = sum(1 for r in rounds if r.get("winner") == t1)
+            t2_r = sum(1 for r in rounds if r.get("winner") == t2)
+            if t1_r > t2_r:
+                t1_maps += 1
+            else:
+                t2_maps += 1
+
+            t1_rows = []
+            t2_rows = []
+            for ps_raw in mm.get("playerStats", []):
+                ps = self._parse_map_player_stat(ps_raw)
+                pid = ps["playerId"]
+                row = {
+                    **ps,
+                    "name": self.players_by_id.get(pid, {}).get("name", f"Player #{pid}"),
+                    "kd": round(ps["kills"] / max(ps["deaths"], 1), 2),
+                    "adr": round(ps["damage"] / r_cnt, 1),
+                    "hsPct": round(ps["hsKills"] * 100.0 / ps["kills"], 1) if ps["kills"] else 0.0,
+                }
+                if pid in t1_pids:
+                    t1_rows.append(row)
+                else:
+                    t2_rows.append(row)
+            t1_rows.sort(key=lambda r: (-r["kills"], r["deaths"]))
+            t2_rows.sort(key=lambda r: (-r["kills"], r["deaths"]))
+
+            maps_out.append(
+                {
+                    "mapName": map_names.get(mm.get("mapId"), f"Map {mm.get('mapId')}"),
+                    "rounds": r_cnt,
+                    "team1Score": t1_r,
+                    "team2Score": t2_r,
+                    "team1ClutchesWon": mm.get("team1ClutchesWon", 0),
+                    "team2ClutchesWon": mm.get("team2ClutchesWon", 0),
+                    "team1Players": t1_rows,
+                    "team2Players": t2_rows,
+                }
+            )
+
+        return {
+            "id": match_id,
+            "datetime": m.get("datetime", {}),
+            "tournamentName": tourn_by_id.get(m.get("tournamentId"), {}).get("name", f"Tournament #{m.get('tournamentId')}"),
+            "team1Name": t1_name,
+            "team2Name": t2_name,
+            "team1Maps": t1_maps,
+            "team2Maps": t2_maps,
+            "team1RankBefore": m.get("team1RankBefore", 0),
+            "team2RankBefore": m.get("team2RankBefore", 0),
+            "team1PointsDelta": m.get("team1PointsDelta", 0),
+            "team2PointsDelta": m.get("team2PointsDelta", 0),
+            "veto": veto,
+            "maps": maps_out,
+        }
+
+    # ---------------------------------------------------------------------
+    # Bug Showcase Analytics
+    # ---------------------------------------------------------------------
+
+    def get_bug_showcase(self) -> dict[str, Any]:
+        """Analyze blowout rates vs CS2 pro baselines, undeserved MVPs/EVPs, and irrational AI transfers."""
+        if not self.data:
+            raise ValueError("No save loaded.")
+
+        blowouts = self._showcase_blowouts()
+        awards = self._showcase_awards()
+        transfers = self._showcase_transfers()
+        stability = self._showcase_stability()
+
+        return {
+            "loaded": True,
+            "blowouts": blowouts,
+            "awards": awards,
+            "transfers": transfers,
+            "stability": stability,
+        }
+
+    def _showcase_blowouts(self) -> dict[str, Any]:
+        assert self.data is not None
+        _, tourn_by_id, map_names = self._stats_lookups()
+
+        total_maps = 0
+        shutouts_13_0 = 0
+        blowouts_le3 = 0
+        halves_12_0 = 0
+        halves_12_0_t = 0
+        halves_12_0_ct = 0
+        halves_12_0_unk = 0
+        r13_after_12_0_total = 0
+        r13_after_12_0_held = 0
+        top20_13_0 = 0
+        upset_13_0 = 0
+
+        close_t_wins = 0
+        close_ct_wins = 0
+        close_r1_t_wins = 0
+        close_r1_total = 0
+
+        # Intra-half win-streak snowball tracker (rounds 2..12)
+        streak_stats: dict[int, list[int]] = {}  # streak_len -> [wins, total]
+
+        examples: list[dict[str, Any]] = []
+
+        for m in self.data.get("matches", {}).get("matches", []):
+            if not m.get("processingCompleted"):
+                continue
+            t1_id = int(m.get("team1Id", 0))
+            t2_id = int(m.get("team2Id", 0))
+            t1_name = self.teams_by_id.get(t1_id, {}).get("name", f"Team #{t1_id}")
+            t2_name = self.teams_by_id.get(t2_id, {}).get("name", f"Team #{t2_id}")
+            t1_rank = int(m.get("team1RankBefore", 0) or 0)
+            t2_rank = int(m.get("team2RankBefore", 0) or 0)
+            t1_odds = float(m.get("team1PreMatchOdds", 0.5) or 0.5)
+            t2_odds = float(m.get("team2PreMatchOdds", 0.5) or 0.5)
+            is_close_match = 0.45 <= t1_odds <= 0.55
+            is_top20_pair = 0 < t1_rank <= 20 and 0 < t2_rank <= 20
+            ev_name = tourn_by_id.get(m.get("tournamentId"), {}).get("name", f"Event #{m.get('tournamentId')}")
+            dt = m.get("datetime", {})
+            date_str = f"{dt.get('year', 0)}-{int(dt.get('month', 0)):02d}-{int(dt.get('day', 0)):02d}"
+
+            for mm in m.get("matchMaps", []):
+                rounds = sorted(mm.get("baseMatchRounds", []), key=lambda r: int(r.get("number", 0)))
+                if not rounds:
+                    continue
+                total_maps += 1
+
+                t1_r = sum(1 for r in rounds if r.get("winner") == t1_id)
+                t2_r = sum(1 for r in rounds if r.get("winner") == t2_id)
+                win_r = max(t1_r, t2_r)
+                lose_r = min(t1_r, t2_r)
+                winner_id = t1_id if t1_r > t2_r else t2_id
+                winner_odds = t1_odds if winner_id == t1_id else t2_odds
+                is_upset = winner_odds < 0.50
+
+                # Infer Half 1 T-side team from winningType (2 = Bomb detonated => T; 3 = Defuse/Time => CT)
+                h1_t_team = 0
+                for r in rounds:
+                    num = int(r.get("number", 0))
+                    wt = int(r.get("winningType", 0))
+                    w = int(r.get("winner", 0))
+                    if num <= 12:
+                        if wt == 2:
+                            h1_t_team = w
+                            break
+                        if wt == 3:
+                            h1_t_team = t2_id if w == t1_id else t1_id
+                            break
+                    elif 13 <= num <= 24:
+                        if wt == 2:
+                            h1_t_team = t2_id if w == t1_id else t1_id
+                            break
+                        if wt == 3:
+                            h1_t_team = w
+                            break
+
+                # Half 1 12-0 + streak snowball
+                h1 = [r for r in rounds if 1 <= int(r.get("number", 0)) <= 12]
+                if len(h1) == 12:
+                    h1_winners = {int(r.get("winner", 0)) for r in h1}
+                    if len(h1_winners) == 1:
+                        halves_12_0 += 1
+                        sweep_team = next(iter(h1_winners))
+                        if h1_t_team:
+                            if sweep_team == h1_t_team:
+                                halves_12_0_t += 1
+                            else:
+                                halves_12_0_ct += 1
+                        else:
+                            halves_12_0_unk += 1
+                        r13 = next((r for r in rounds if int(r.get("number", 0)) == 13), None)
+                        if r13:
+                            r13_after_12_0_total += 1
+                            if int(r13.get("winner", 0)) == sweep_team:
+                                r13_after_12_0_held += 1
+
+                    # Track active H1 streak before round i (rounds 2..12)
+                    cur_team = int(h1[0].get("winner", 0))
+                    cur_streak = 1
+                    for r in h1[1:]:
+                        key = min(cur_streak, 8)
+                        bucket = streak_stats.setdefault(key, [0, 0])
+                        bucket[1] += 1
+                        rw = int(r.get("winner", 0))
+                        if rw == cur_team:
+                            bucket[0] += 1
+                            cur_streak += 1
+                        else:
+                            cur_team = rw
+                            cur_streak = 1
+
+                # Close-match T vs CT skew (reg rounds 1..24)
+                if is_close_match and h1_t_team:
+                    for r in rounds:
+                        num = int(r.get("number", 0))
+                        if num > 24:
+                            continue
+                        rw = int(r.get("winner", 0))
+                        t_on_round = h1_t_team if num <= 12 else (t2_id if h1_t_team == t1_id else t1_id)
+                        if rw == t_on_round:
+                            close_t_wins += 1
+                            if num == 1:
+                                close_r1_t_wins += 1
+                        else:
+                            close_ct_wins += 1
+                        if num == 1:
+                            close_r1_total += 1
+
+                if win_r == 13 and lose_r == 0:
+                    shutouts_13_0 += 1
+                    if is_top20_pair:
+                        top20_13_0 += 1
+                    if is_upset:
+                        upset_13_0 += 1
+
+                if win_r == 13 and lose_r <= 3:
+                    blowouts_le3 += 1
+                    tags = []
+                    if lose_r == 0:
+                        tags.append("13-0")
+                    else:
+                        tags.append(f"13-{lose_r}")
+                    if is_top20_pair:
+                        tags.append("Top 20 vs Top 20")
+                    if is_upset:
+                        tags.append(f"Upset ({round(winner_odds * 100)}% odds)")
+                    if len(examples) < 250:
+                        examples.append(
+                            {
+                                "matchId": int(m.get("id", 0)),
+                                "date": date_str,
+                                "dateKey": self._match_date_key(dt),
+                                "event": ev_name,
+                                "mapName": map_names.get(mm.get("mapId"), f"Map {mm.get('mapId')}"),
+                                "team1Id": t1_id,
+                                "team1Name": t1_name,
+                                "team1Rank": t1_rank,
+                                "team2Id": t2_id,
+                                "team2Name": t2_name,
+                                "team2Rank": t2_rank,
+                                "team1Score": t1_r,
+                                "team2Score": t2_r,
+                                "loseScore": lose_r,
+                                "winnerOdds": round(winner_odds * 100, 1),
+                                "isTop20": is_top20_pair,
+                                "isUpset": is_upset,
+                                "tags": tags,
+                            }
+                        )
+
+        examples.sort(key=lambda e: (e["loseScore"], -(1 if e["isTop20"] else 0), -(1 if e["isUpset"] else 0), -e["dateKey"][0], -e["dateKey"][1], -e["dateKey"][2]))
+
+        shutout_pct = round(shutouts_13_0 * 100.0 / total_maps, 2) if total_maps else 0.0
+        blowout_le3_pct = round(blowouts_le3 * 100.0 / total_maps, 2) if total_maps else 0.0
+        half_12_0_pct = round(halves_12_0 * 100.0 / total_maps, 2) if total_maps else 0.0
+        close_tot = close_t_wins + close_ct_wins
+
+        streak_curve = []
+        for s_len in sorted(streak_stats.keys()):
+            w_cnt, tot_cnt = streak_stats[s_len]
+            streak_curve.append(
+                {
+                    "streakLabel": f"{s_len}+" if s_len == 8 else str(s_len),
+                    "wins": w_cnt,
+                    "total": tot_cnt,
+                    "holdPct": round(w_cnt * 100.0 / tot_cnt, 1) if tot_cnt else 0.0,
+                }
+            )
+
+        pro_13_0_mid = 1.1  # HLTV CS2 MR12 tier-1/pro shutout rate (~0.8% - 1.5%)
+        pro_le3_mid = 13.5  # HLTV CS2 MR12 pro <=3 rounds blowout rate (~12% - 15%)
+        pro_12_0_mid = 0.45
+
+        return {
+            "totalMaps": total_maps,
+            "shutouts13_0": shutouts_13_0,
+            "shutoutPct": shutout_pct,
+            "pro13_0Range": "0.8% - 1.5%",
+            "pro13_0Baseline": pro_13_0_mid,
+            "shutoutMultiplier": round(shutout_pct / pro_13_0_mid, 2) if pro_13_0_mid else 0.0,
+            "blowoutsLe3": blowouts_le3,
+            "blowoutLe3Pct": blowout_le3_pct,
+            "proLe3Range": "12% - 15%",
+            "proLe3Baseline": pro_le3_mid,
+            "blowoutMultiplier": round(blowout_le3_pct / pro_le3_mid, 2) if pro_le3_mid else 0.0,
+            "halves12_0": halves_12_0,
+            "half12_0Pct": half_12_0_pct,
+            "pro12_0Baseline": pro_12_0_mid,
+            "halves12_0T": halves_12_0_t,
+            "halves12_0Ct": halves_12_0_ct,
+            "halves12_0Unk": halves_12_0_unk,
+            "r13After12_0Total": r13_after_12_0_total,
+            "r13After12_0HeldPct": round(r13_after_12_0_held * 100.0 / r13_after_12_0_total, 1) if r13_after_12_0_total else 0.0,
+            "top20_13_0": top20_13_0,
+            "upset_13_0": upset_13_0,
+            "upset_13_0Pct": round(upset_13_0 * 100.0 / shutouts_13_0, 1) if shutouts_13_0 else 0.0,
+            "closeTWinPct": round(close_t_wins * 100.0 / close_tot, 1) if close_tot else 50.0,
+            "closeR1TWinPct": round(close_r1_t_wins * 100.0 / close_r1_total, 1) if close_r1_total else 50.0,
+            "streakCurve": streak_curve,
+            "examples": examples[:120],
+            "rootCauses": [
+                {
+                    "title": "1. Broken Helmet Damage Overwrite",
+                    "symbol": "Weapon::CalculateDamage",
+                    "summary": "When a target has a helmet, damage is overwritten with `damage * armorMultiplier` — wiping out the headshot multiplier and distance dropoff. Winners with helmets take ~27 dmg from an AK headshot while unhelmeted broke defenders take ~144.",
+                },
+                {
+                    "title": "2. Post-Plant Probabilities Copy-Paste Bug",
+                    "symbol": "SimulationManager::CheckForRoundOverAndPostPlantInitiation",
+                    "summary": "Stage 5 computes `atkStrength` into a local variable and then never uses it — BOTH numerator and denominator use `(1 + defStrength)` so defense cancels out. T-side always gets >=50% (often 61%+) post-plant odds even in 1v5 retakes.",
+                },
+                {
+                    "title": "3. Inverted Armor Reserve Budget",
+                    "symbol": "MatchPurchaseFunctions::SetPlayerPurchaseBudget",
+                    "summary": "Reserves $650 with `hasArmor ? 650 : 0` — charging players who ALREADY have armor instead of unarmored eco/force players, starving losing defenders of full utility and rifles.",
+                },
+                {
+                    "title": "4. Chaotic Force-Buy Loop & No Bomb Plant Bonus",
+                    "symbol": "BaseMatchTeam::SetPurchaseStrategy & ApplyRoundMoney",
+                    "summary": "A `Save` decision flips to `FullSpend` on `Random.value <= forceBuy * 0.6f`, trapping losing teams on SMG/Deagle half-buys every round, compounded by missing the CS2 +$800 T bomb-plant team bonus.",
+                },
+            ],
+        }
+
+    def _showcase_awards(self) -> dict[str, Any]:
+        assert self.data is not None
+        tmpl_names, _, _ = self._stats_lookups()
+        tournaments = self.data.get("tournaments", {}).get("tournaments", [])
+        stages = self.data.get("tournamentStages", {}).get("tournamentStages", [])
+        pcs = self.data.get("playerCareerStats", {}).get("playerCareerStats", [])
+        matches = self.data.get("matches", {}).get("matches", [])
+
+        # Map champion team_id from teams[].trophyHistories
+        champions_by_tid: dict[int, int] = {}
+        for tid_k, t_obj in self.teams_by_id.items():
+            for th in t_obj.get("trophyHistories", []):
+                ch_tid = int(th.get("tournamentId", 0) or 0)
+                if ch_tid:
+                    champions_by_tid[ch_tid] = int(tid_k)
+
+        t_end: dict[int, tuple[int, int, int]] = {}
+        stage_by_id: dict[int, dict[str, Any]] = {}
+        stages_by_tid: dict[int, list[dict[str, Any]]] = {}
+        for s in stages:
+            sid = int(s.get("id", 0) or 0)
+            pid = int(s.get("parentId", 0) or 0)
+            stage_by_id[sid] = s
+            stages_by_tid.setdefault(pid, []).append(s)
+            dt = s.get("endDatetime") or {}
+            y, m, d = int(dt.get("year", 0) or 0), int(dt.get("month", 0) or 0), int(dt.get("day", 0) or 0)
+            if pid and y > 10:
+                prev = t_end.get(pid)
+                if prev is None or (y, m, d) > prev:
+                    t_end[pid] = (y, m, d)
+
+        t_months: dict[int, set[tuple[int, int]]] = {}
+        matches_by_stage: dict[int, list[dict[str, Any]]] = {}
+        for m in matches:
+            if not m.get("processingCompleted"):
+                continue
+            sid = int(m.get("tournamentId", 0) or 0)
+            matches_by_stage.setdefault(sid, []).append(m)
+            st = stage_by_id.get(sid)
+            if st and "QUALIFIER" not in (st.get("name") or "").upper():
+                tid = int(st.get("parentId", 0) or 0)
+                dt = m.get("datetime", {})
+                y, mo = int(dt.get("year", 0) or 0), int(dt.get("month", 0) or 0)
+                if tid and y > 10:
+                    t_months.setdefault(tid, set()).add((y, mo))
+
+        def _match_wl(m: dict[str, Any]) -> tuple[int, int]:
+            t1 = int(m.get("team1Id", 0) or 0)
+            t2 = int(m.get("team2Id", 0) or 0)
+            s1 = s2 = 0
+            for mm in m.get("matchMaps", []):
+                r1 = sum(1 for r in mm.get("baseMatchRounds", []) if r.get("winner") == t1)
+                r2 = sum(1 for r in mm.get("baseMatchRounds", []) if r.get("winner") == t2)
+                if r1 > r2:
+                    s1 += 1
+                elif r2 > r1:
+                    s2 += 1
+            return (t1, t2) if s1 >= s2 else (t2, t1)
+
+        def _team_placements(tid: int) -> dict[int, tuple[str, float]]:
+            # Placement multipliers: 1st=1.10x, 2nd=1.08x, 3rd-4th=1.04x, 5th-8th=1.02x, Other=1.00x
+            placements: dict[int, tuple[str, float]] = {}
+            if tid in champions_by_tid:
+                placements[champions_by_tid[tid]] = ("1st", 1.10)
+            cand = [
+                s
+                for s in stages_by_tid.get(tid, [])
+                if "QUALIFIER" not in (s.get("name") or "").upper() and matches_by_stage.get(int(s.get("id", 0)))
+            ]
+            if not cand:
+                return placements
+            final_stage = max(cand, key=lambda s: (int(s.get("stage", 0) or 0), int(s.get("id", 0) or 0)))
+            ms = matches_by_stage.get(int(final_stage.get("id", 0)), [])
+            is_playoff = "PLAYOFF" in (final_stage.get("name") or "").upper() or int(final_stage.get("formatType", -1)) == 0
+            if is_playoff and ms:
+                upper = [m for m in ms if not m.get("lowerBracket")]
+                if upper:
+                    max_r = max(int(m.get("round", 0) or 0) for m in upper)
+                    finals = [m for m in upper if int(m.get("round", 0) or 0) == max_r]
+                    if len(finals) == 1:
+                        w, l = _match_wl(finals[0])
+                        placements.setdefault(w, ("1st", 1.10))
+                        placements.setdefault(l, ("2nd", 1.08))
+                        for m in upper:
+                            r = int(m.get("round", 0) or 0)
+                            _, ml = _match_wl(m)
+                            if r == max_r - 1:
+                                placements.setdefault(ml, ("3rd-4th", 1.04))
+                            elif r == max_r - 2:
+                                placements.setdefault(ml, ("5th-8th", 1.02))
+            return placements
+
+        pcs_by_tpl_ym: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
+        for r in pcs:
+            mw = int(r.get("matchesWon", 0) or 0)
+            ml = int(r.get("matchesLost", 0) or 0)
+            if mw + ml <= 0:
+                continue
+            key = (int(r.get("tournamentTemplate", 0)), int(r.get("year", 0)), int(r.get("month", 0)))
+            pcs_by_tpl_ym.setdefault(key, []).append(r)
+
+        # Also detect duplicate (MVP + EVP) in playerAwards and collect real MVP/EVP events (excluding mock year <= 10)
+        dup_awards: list[dict[str, Any]] = []
+        mock_awards_hidden = 0
+        real_award_events: set[tuple[int, int, int]] = set()
+        for pid, p in self.players_by_id.items():
+            seen_ev: dict[tuple[int, int, int], set[int]] = {}
+            for a in p.get("playerAwards", []):
+                y = int(a.get("year", 0) or 0)
+                if y <= 10:
+                    mock_awards_hidden += 1
+                    continue
+                atype = int(a.get("type", -1))
+                tpl = int(a.get("tournamentTemplate", 0) or 0)
+                mo = int(a.get("month", 0) or 0)
+                if atype in (0, 2):
+                    real_award_events.add((tpl, y, mo))
+                    seen_ev.setdefault((tpl, y, mo), set()).add(atype)
+            for (tpl, y, mo), types in seen_ev.items():
+                if 0 in types and 2 in types:
+                    dup_awards.append(
+                        {
+                            "severity": 85,
+                            "role": "MVP + EVP",
+                            "playerId": pid,
+                            "playerName": p.get("name", f"Player #{pid}"),
+                            "teamId": 0,
+                            "teamName": "—",
+                            "event": tmpl_names.get(tpl, f"Event #{tpl}"),
+                            "date": f"{y}-{mo:02d}",
+                            "rating": 0.0,
+                            "weightedScore": 0.0,
+                            "placement": "—",
+                            "placementMult": 1.0,
+                            "matches": 0,
+                            "wins": 0,
+                            "losses": 0,
+                            "kpr": 0.0,
+                            "adr": 0.0,
+                            "eventRank": 0,
+                            "fieldSize": 0,
+                            "bestPlayerId": 0,
+                            "bestPlayerName": "—",
+                            "bestPlayerRating": 0.0,
+                            "bestPlacement": "—",
+                            "bestWeightedScore": 0.0,
+                            "ratingGap": 0.0,
+                            "reasons": ["Player received BOTH MVP and EVP for the same tournament"],
+                        }
+                    )
+
+        total_evaluated = 0
+        total_mvps = 0
+        total_evps = 0
+        sub110_evps = 0
+        outranked_mvps = 0
+        flagged: list[dict[str, Any]] = list(dup_awards)
+
+        for t in tournaments:
+            tid = int(t.get("id", 0))
+            pa = t.get("playersAwarded") or []
+            if not pa:
+                continue
+            tpl = int(t.get("template", 0))
+            months = set(t_months.get(tid, set()))
+            end_dt = t_end.get(tid)
+            if end_dt:
+                months.add((end_dt[0], end_dt[1]))
+            if not months:
+                continue
+            # Only evaluate tournaments that actually grant MVP/EVP awards (not low-reputation tournaments)
+            if real_award_events:
+                if not any((tpl, yy, mm) in real_award_events for yy, mm in months):
+                    continue
+            elif int(t.get("reputation", 0) or 0) < 15:
+                continue
+
+            placements = _team_placements(tid)
+            pstats: dict[int, dict[str, Any]] = {}
+            for yy, mm in months:
+                for r in pcs_by_tpl_ym.get((tpl, yy, mm), []):
+                    pid = int(r.get("playerId", 0))
+                    st = pstats.setdefault(
+                        pid,
+                        {"m": 0, "mw": 0, "ml": 0, "rat_sum": 0.0, "rp": 0, "k": 0, "d": 0, "dmg": 0, "team_id": 0},
+                    )
+                    mw = int(r.get("matchesWon", 0) or 0)
+                    ml = int(r.get("matchesLost", 0) or 0)
+                    st["m"] += mw + ml
+                    st["mw"] += mw
+                    st["ml"] += ml
+                    st["rat_sum"] += float(r.get("accumulativeRating", 0.0) or 0.0)
+                    st["rp"] += int(r.get("roundsPlayed", 0) or 0)
+                    st["k"] += int(r.get("accumulatedKills", 0) or 0)
+                    st["d"] += int(r.get("accumulateDeaths", 0) or 0)
+                    st["dmg"] += int(r.get("accumulatedDamage", 0) or 0)
+                    st["team_id"] = int(r.get("teamId", 0) or 0)
+
+            max_m = max((st["m"] for st in pstats.values()), default=0)
+            min_q = max(2, int(round(max_m * 0.45))) if max_m >= 4 else 1
+
+            weighted_pool = []
+            for pid, st in pstats.items():
+                if st["m"] < min_q:
+                    continue
+                rat = st["rat_sum"] / st["m"]
+                pl_lbl, mult = placements.get(st["team_id"], ("Other", 1.00))
+                w_score = rat * mult
+                weighted_pool.append((w_score, rat, pl_lbl, mult, st["m"], pid, st))
+            weighted_pool.sort(reverse=True)
+            if not weighted_pool:
+                continue
+
+            w_rank = {x[5]: idx + 1 for idx, x in enumerate(weighted_pool)}
+            best_w, best_rat, best_pl, _, _, best_pid, _ = weighted_pool[0]
+            best_name = self.players_by_id.get(best_pid, {}).get("name", f"Player #{best_pid}")
+            date_str = f"{end_dt[0]}-{end_dt[1]:02d}" if end_dt else f"{max(months)[0]}-{max(months)[1]:02d}"
+            ev_name = t.get("name") or tmpl_names.get(tpl, f"Tournament #{tid}")
+
+            for idx, raw_pid in enumerate(pa):
+                pid = int(raw_pid or 0)
+                role = "MVP" if idx == 0 else "EVP"
+                total_evaluated += 1
+                if role == "MVP":
+                    total_mvps += 1
+                else:
+                    total_evps += 1
+
+                if pid <= 0 or pid not in self.players_by_id:
+                    flagged.append(
+                        {
+                            "severity": 95,
+                            "role": role,
+                            "playerId": pid,
+                            "playerName": f"Invalid Player (#{pid})",
+                            "teamId": 0,
+                            "teamName": "—",
+                            "event": ev_name,
+                            "date": date_str,
+                            "rating": 0.0,
+                            "weightedScore": 0.0,
+                            "placement": "—",
+                            "placementMult": 1.0,
+                            "matches": 0,
+                            "wins": 0,
+                            "losses": 0,
+                            "kpr": 0.0,
+                            "adr": 0.0,
+                            "eventRank": 0,
+                            "fieldSize": len(weighted_pool),
+                            "bestPlayerId": best_pid,
+                            "bestPlayerName": best_name,
+                            "bestPlayerRating": round(best_rat, 2),
+                            "bestPlacement": best_pl,
+                            "bestWeightedScore": round(best_w, 2),
+                            "ratingGap": round(best_w, 2),
+                            "reasons": [f"Broken award slot (ID {pid}) written into tournament playersAwarded"],
+                        }
+                    )
+                    continue
+
+                st = pstats.get(pid)
+                if not st or st["m"] == 0:
+                    continue
+                rat = st["rat_sum"] / st["m"]
+                rp = max(st["rp"], 1)
+                kpr = st["k"] / rp
+                adr = st["dmg"] / rp
+                team_id = st["team_id"]
+                team_name = self.teams_by_id.get(team_id, {}).get("name", "—")
+                pl_lbl, mult = placements.get(team_id, ("Other", 1.00))
+                w_score = rat * mult
+                rk = w_rank.get(pid, len(weighted_pool) + 1)
+                w_gap = best_w - w_score
+
+                # HLTV-realistic MVP/EVP evaluation:
+                # Winning trophy carries huge weight; non-champions need an overwhelming rating + deep run to steal MVP.
+                mvp_req = {
+                    "1st": (0.05, 0.0),
+                    "2nd": (0.18, 1.42),
+                    "3rd-4th": (0.25, 1.48),
+                    "5th-8th": (0.28, 1.50),
+                    "Other": (0.30, 1.50),
+                }
+                awarded_set = {int(x or 0) for x in pa if int(x or 0) > 0}
+                reasons = []
+                severity = 0.0
+                disp_best_id = best_pid
+                disp_best_name = best_name
+                disp_best_rat = best_rat
+                disp_best_pl = best_pl
+                disp_best_w = best_w
+
+                if role == "MVP":
+                    mvp_m = st["m"]
+                    if rat < 1.18:
+                        outranked_mvps += 1
+                        reasons.append(f"Carried champion MVP ({rat:.2f} rating < 1.18 HLTV baseline)")
+                        severity += 40 + (1.20 - rat) * 200
+                    # Check if a teammate outperformed the MVP
+                    best_mate = None
+                    for o_pid, o_st in pstats.items():
+                        if o_pid != pid and int(o_st["team_id"]) == team_id and o_st["m"] >= max(2, int(round(mvp_m * 0.75))):
+                            o_rat = o_st["rat_sum"] / o_st["m"]
+                            if o_rat > rat + 0.05 and (best_mate is None or o_rat > best_mate[0]):
+                                best_mate = (o_rat, o_pid)
+                    if best_mate:
+                        outranked_mvps += 1
+                        m_rat, m_pid = best_mate
+                        m_name = self.players_by_id.get(m_pid, {}).get("name", f"Player #{m_pid}")
+                        reasons.append(f"Teammate {m_name} posted {m_rat:.2f} vs MVP's {rat:.2f} (+{m_rat - rat:.2f})")
+                        severity += 45 + (m_rat - rat) * 180
+                        disp_best_id, disp_best_name, disp_best_rat, disp_best_pl, disp_best_w = (
+                            m_pid, m_name, m_rat, pl_lbl, m_rat * mult
+                        )
+                    # Check if a non-champion superstar overwhelmingly outcarried the MVP
+                    best_other = None
+                    for o_pid, o_st in pstats.items():
+                        if o_pid == pid or o_st["m"] < max(2, int(round(mvp_m * 0.60))):
+                            continue
+                        o_rat = o_st["rat_sum"] / o_st["m"]
+                        o_pl, o_mult = placements.get(int(o_st["team_id"]), ("Other", 1.00))
+                        min_gap, min_floor = mvp_req.get(o_pl, (0.30, 1.50))
+                        if o_rat >= min_floor and (o_rat - rat) >= min_gap:
+                            if best_other is None or o_rat > best_other[0]:
+                                best_other = (o_rat, o_pid, o_pl, o_mult, o_st["m"])
+                    if best_other:
+                        outranked_mvps += 1
+                        o_rat, o_pid, o_pl, o_mult, o_m = best_other
+                        o_name = self.players_by_id.get(o_pid, {}).get("name", f"Player #{o_pid}")
+                        reasons.append(
+                            f"Outcarried by {o_name} ({o_rat:.2f} in {o_pl}, {o_m}m, +{o_rat - rat:.2f} over MVP)"
+                        )
+                        severity += 40 + (o_rat - rat) * 150
+                        disp_best_id, disp_best_name, disp_best_rat, disp_best_pl, disp_best_w = (
+                            o_pid, o_name, o_rat, o_pl, o_rat * o_mult
+                        )
+
+                if role == "EVP":
+                    # Find best snubbed non-awarded player with real sample size
+                    best_snub = None
+                    for o_pid, o_st in pstats.items():
+                        if o_pid in awarded_set or o_st["m"] < min_q:
+                            continue
+                        o_rat = o_st["rat_sum"] / o_st["m"]
+                        o_pl, o_mult = placements.get(int(o_st["team_id"]), ("Other", 1.00))
+                        if o_pl in ("1st", "2nd", "3rd-4th") or o_st["m"] >= max(3, int(round(max_m * 0.70))):
+                            if best_snub is None or (o_rat * o_mult) > (best_snub[0] * best_snub[3]):
+                                best_snub = (o_rat, o_pid, o_pl, o_mult)
+
+                    if rat < 1.10:
+                        sub110_evps += 1
+                        reasons.append(f"Sub-1.10 EVP ({rat:.2f}, KPR {kpr:.2f}, ADR {adr:.0f})")
+                        severity += (1.15 - rat) * 260
+                    elif rat < 1.15 and best_snub and (best_snub[0] - rat) >= 0.16:
+                        s_rat, s_pid, s_pl, s_mult = best_snub
+                        s_name = self.players_by_id.get(s_pid, {}).get("name", f"Player #{s_pid}")
+                        reasons.append(
+                            f"Low {rat:.2f} EVP ({pl_lbl} quota) while {s_name} ({s_rat:.2f}, {s_pl}) got no award"
+                        )
+                        severity += 20 + (s_rat - rat) * 100
+                        disp_best_id, disp_best_name, disp_best_rat, disp_best_pl, disp_best_w = (
+                            s_pid, s_name, s_rat, s_pl, s_rat * s_mult
+                        )
+
+                    if rat < 1.13 and adr < 76.0 and kpr < 0.72:
+                        reasons.append(f"Low fragging impact ({kpr:.2f} KPR, {adr:.1f} ADR)")
+                        severity += 15
+
+                if reasons:
+                    flagged.append(
+                        {
+                            "severity": round(severity, 1),
+                            "role": role,
+                            "playerId": pid,
+                            "playerName": self.players_by_id[pid].get("name", f"Player #{pid}"),
+                            "teamId": team_id,
+                            "teamName": team_name,
+                            "event": ev_name,
+                            "date": date_str,
+                            "rating": round(rat, 2),
+                            "weightedScore": round(w_score, 2),
+                            "placement": pl_lbl,
+                            "placementMult": mult,
+                            "matches": st["m"],
+                            "wins": st["mw"],
+                            "losses": st["ml"],
+                            "kpr": round(kpr, 2),
+                            "adr": round(adr, 1),
+                            "eventRank": rk,
+                            "fieldSize": len(weighted_pool),
+                            "bestPlayerId": disp_best_id,
+                            "bestPlayerName": disp_best_name,
+                            "bestPlayerRating": round(disp_best_rat, 2),
+                            "bestPlacement": disp_best_pl,
+                            "bestWeightedScore": round(disp_best_w, 2),
+                            "ratingGap": round(disp_best_rat - rat, 2),
+                            "reasons": reasons,
+                        }
+                    )
+
+        flagged.sort(key=lambda r: (-r["severity"], r["rating"]))
+
+        return {
+            "totalEvaluated": total_evaluated,
+            "totalMvps": total_mvps,
+            "totalEvps": total_evps,
+            "flaggedCount": len(flagged),
+            "sub110Evps": sub110_evps,
+            "outrankedMvps": outranked_mvps,
+            "duplicateMvpEvps": len(dup_awards),
+            "mockAwardsHidden": mock_awards_hidden,
+            "flagged": flagged[:150],
+        }
+
+    def _showcase_transfers(self) -> dict[str, Any]:
+        assert self.data is not None
+
+        team_starters: dict[int, list[tuple[float, dict[str, Any], dict[str, Any]]]] = {}
+        team_benched: dict[int, list[tuple[float, dict[str, Any], dict[str, Any]]]] = {}
+        for pid, c in self.player_contract_by_pid.items():
+            p = self.players_by_id.get(pid)
+            if not p:
+                continue
+            tid = int(c.get("teamId", 0) or 0)
+            sk = _player_avg_skill(p)
+            if c.get("benched"):
+                team_benched.setdefault(tid, []).append((sk, p, c))
+            else:
+                team_starters.setdefault(tid, []).append((sk, p, c))
+
+        for lst in team_starters.values():
+            lst.sort(key=lambda x: -x[0])
+        for lst in team_benched.values():
+            lst.sort(key=lambda x: -x[0])
+
+        # 1. Teams currently benching a strictly stronger player than an active starter
+        benched_crimes: list[dict[str, Any]] = []
+        for tid, b_list in team_benched.items():
+            s_list = team_starters.get(tid, [])
+            if not s_list:
+                continue
+            worst_sk, worst_p, _ = s_list[-1]
+            tname = self.teams_by_id.get(tid, {}).get("name", f"Team #{tid}")
+            for b_sk, bp, _ in b_list:
+                diff = round(b_sk - worst_sk, 2)
+                if diff >= 0.25:
+                    benched_crimes.append(
+                        {
+                            "teamId": tid,
+                            "teamName": tname,
+                            "benchedId": int(bp["id"]),
+                            "benchedName": bp.get("name", "?"),
+                            "benchedSkill": round(b_sk, 2),
+                            "benchedAge": int(bp.get("age", 0)),
+                            "starterId": int(worst_p["id"]),
+                            "starterName": worst_p.get("name", "?"),
+                            "starterSkill": round(worst_sk, 2),
+                            "starterAge": int(worst_p.get("age", 0)),
+                            "skillDiff": diff,
+                        }
+                    )
+        benched_crimes.sort(key=lambda r: -r["skillDiff"])
+
+        # 2. Historical AI player transfers
+        raw_transfers = [
+            x for x in self.data.get("transferHistories", {}).get("transferHistories", []) if int(x.get("personType", -1)) == 0
+        ]
+        transfers_by_pid: dict[int, int] = {}
+        for x in raw_transfers:
+            pid = int(x.get("personId", 0))
+            transfers_by_pid[pid] = transfers_by_pid.get(pid, 0) + 1
+
+        # Infer each nation's official/dominant national language(s) from native players' fluent languages (>=15)
+        nat_lang_counts: dict[int, dict[int, int]] = {}
+        for p_obj in self.players_by_id.values():
+            p_n = int(p_obj.get("nation", 0) or 0)
+            if not p_n:
+                continue
+            for lg in p_obj.get("languagesSpoken", []):
+                if int(lg.get("languageSkill", 0) or 0) >= 15:
+                    lid = int(lg.get("languageId", 0) or 0)
+                    if lid:
+                        bucket = nat_lang_counts.setdefault(p_n, {})
+                        bucket[lid] = bucket.get(lid, 0) + 1
+        nation_req_langs: dict[int, set[int]] = {}
+        for p_n, cnts in nat_lang_counts.items():
+            ranked = sorted(cnts.items(), key=lambda z: -z[1])
+            allowed = {ranked[0][0]}
+            if len(ranked) > 1 and ranked[1][1] >= ranked[0][1] * 0.40:
+                allowed.add(ranked[1][0])
+            nation_req_langs[p_n] = allowed
+
+        def _person_lang_ids(person: dict[str, Any]) -> set[int]:
+            return {
+                int(lg.get("languageId", 0) or 0)
+                for lg in person.get("languagesSpoken", [])
+                if int(lg.get("languageSkill", 0) or 0) >= 10
+            }
+
+        def _fmt_langs(lids: set[int]) -> str:
+            if not lids:
+                return "None"
+            return ", ".join(sorted(LANGUAGES.get(lid, f"#{lid}") for lid in lids))
+
+        flagged_transfers: list[dict[str, Any]] = []
+        total_spend_wasted = 0
+        signed_over_better_bench = 0
+        signed_then_benched = 0
+        multi_moved_count = 0
+
+        for x in raw_transfers:
+            pid = int(x.get("personId", 0))
+            p = self.players_by_id.get(pid)
+            if not p:
+                continue
+            sk = _player_avg_skill(p)
+            age = int(p.get("age", 0) or 0)
+            from_id = int(x.get("fromTeamId", 0) or 0)
+            to_id = int(x.get("otherTeamId", 0) or 0)
+            price = int(x.get("purchasePrice", 0) or 0)
+            dt = x.get("datetime", {})
+            date_str = f"{dt.get('year', 0)}-{int(dt.get('month', 0)):02d}-{int(dt.get('day', 0)):02d}"
+
+            c = self.player_contract_by_pid.get(pid)
+            b_list = team_benched.get(to_id, [])
+            s_list = team_starters.get(to_id, [])
+            best_b = b_list[0] if b_list else None
+            worst_s = s_list[-1] if s_list else None
+
+            reasons = []
+            severity = 0.0
+            compare_name = "—"
+            compare_skill = 0.0
+
+            if c and int(c.get("teamId", 0)) == to_id and c.get("benched"):
+                signed_then_benched += 1
+                reasons.append(f"Signed to {self.teams_by_id.get(to_id, {}).get('name', '?')} (${price:,}) and currently BENCHED")
+                severity += 45 + (price / 25000.0)
+
+            if best_b and best_b[1]["id"] != pid and best_b[0] > sk + 0.30:
+                signed_over_better_bench += 1
+                gap = round(best_b[0] - sk, 2)
+                compare_name = f"{best_b[1].get('name')} (Benched)"
+                compare_skill = round(best_b[0], 2)
+                reasons.append(f"Team benches superior {best_b[1].get('name')} ({best_b[0]:.2f}, +{gap:.2f}) while fielding/signing {sk:.2f}")
+                severity += 35 + gap * 18 + (price / 35000.0)
+
+            if worst_s and worst_s[1]["id"] != pid and len(s_list) >= 5 and sk < worst_s[0] - 0.50:
+                gap = round(worst_s[0] - sk, 2)
+                if compare_name == "—":
+                    compare_name = f"{worst_s[1].get('name')} (Worst Starter)"
+                    compare_skill = round(worst_s[0], 2)
+                reasons.append(f"Weaker than team's worst starter {worst_s[1].get('name')} ({worst_s[0]:.2f} vs {sk:.2f})")
+                severity += 20 + gap * 14
+
+            if age >= 30 and price >= 100000:
+                reasons.append(f"Paid ${price:,} for age-{age} veteran ({sk:.2f} avg skill)")
+                severity += 18 + (age - 29) * 5 + (price / 50000.0)
+
+            move_cnt = transfers_by_pid.get(pid, 1)
+            if move_cnt >= 2:
+                multi_moved_count += 1
+                reasons.append(f"Transferred {move_cnt}x in carousel")
+                severity += 14 * move_cnt
+
+            to_team = self.teams_by_id.get(to_id, {})
+            hiring_bias = int((to_team.get("owner") or {}).get("hiringBias", -1))
+            t_nat = int(to_team.get("nation", 0) or 0)
+            p_nat = int(p.get("nation", 0) or 0)
+            if hiring_bias == 0 and t_nat and p_nat and t_nat != p_nat:
+                t_nat_name = NATIONS.get(t_nat, f"Nation #{t_nat}")
+                p_nat_name = NATIONS.get(p_nat, f"Nation #{p_nat}")
+                reasons.append(f"'Only National' ({t_nat_name}) club signed foreign player ({p_nat_name})")
+                severity += 42 + (price / 25000.0)
+            elif hiring_bias == 1 and t_nat:
+                req_langs = nation_req_langs.get(t_nat, set())
+                p_langs = _person_lang_ids(p)
+                if req_langs and not (p_langs & req_langs):
+                    reasons.append(
+                        f"'Only National Language' ({_fmt_langs(req_langs)}) club signed player speaking {_fmt_langs(p_langs)}"
+                    )
+                    severity += 38 + (price / 25000.0)
+
+            if reasons:
+                total_spend_wasted += price
+                flagged_transfers.append(
+                    {
+                        "severity": round(severity, 1),
+                        "date": date_str,
+                        "dateKey": self._match_date_key(dt),
+                        "playerId": pid,
+                        "playerName": p.get("name", f"Player #{pid}"),
+                        "skill": round(sk, 2),
+                        "age": age,
+                        "fromTeamId": from_id,
+                        "fromTeamName": "Free Agent" if from_id == 0 else self.teams_by_id.get(from_id, {}).get("name", f"#{from_id}"),
+                        "toTeamId": to_id,
+                        "toTeamName": self.teams_by_id.get(to_id, {}).get("name", f"#{to_id}"),
+                        "purchasePrice": price,
+                        "compareName": compare_name,
+                        "compareSkill": compare_skill,
+                        "reasons": reasons,
+                    }
+                )
+
+        flagged_transfers.sort(key=lambda r: (-r["severity"], -r["purchasePrice"], -r["dateKey"][0], -r["dateKey"][1]))
+
+        # 3. "Only National" (hiringBias == 0) & "Only National Language" (hiringBias == 1) Policy Violations
+        strict_teams = {
+            int(tid): (t, int((t.get("owner") or {}).get("hiringBias", -1)))
+            for tid, t in self.teams_by_id.items()
+            if int((t.get("owner") or {}).get("hiringBias", -1)) in (0, 1)
+        }
+        only_national_count = sum(1 for _, hb in strict_teams.values() if hb == 0)
+        only_lang_count = sum(1 for _, hb in strict_teams.values() if hb == 1)
+
+        policy_map: dict[tuple[int, int, int, str], dict[str, Any]] = {}
+        policy_tx_players = 0
+        policy_tx_staff = 0
+        policy_hb0_players = 0
+        policy_hb0_staff = 0
+        policy_hb1_players = 0
+        policy_hb1_staff = 0
+        policy_spend = 0
+
+        def _check_policy(t_obj: dict[str, Any], hb: int, person: dict[str, Any]) -> tuple[bool, str, str]:
+            t_nat = int(t_obj.get("nation", 0) or 0)
+            p_nat = int(person.get("nation", 0) or 0)
+            if hb == 0 and t_nat and p_nat and t_nat != p_nat:
+                return True, "hb0", f"Only National ({NATIONS.get(t_nat, f'#{t_nat}')})"
+            if hb == 1 and t_nat:
+                req_langs = nation_req_langs.get(t_nat, set())
+                p_langs = _person_lang_ids(person)
+                if req_langs and not (p_langs & req_langs):
+                    return True, "hb1", f"Only {_fmt_langs(req_langs)} (Speaks: {_fmt_langs(p_langs)})"
+            return False, "", ""
+
+        for x in self.data.get("transferHistories", {}).get("transferHistories", []):
+            to_id = int(x.get("otherTeamId", 0) or 0)
+            if to_id not in strict_teams:
+                continue
+            t, hb = strict_teams[to_id]
+            ptype = int(x.get("personType", -1))
+            pid = int(x.get("personId", 0))
+            person = self.players_by_id.get(pid) if ptype == 0 else (self.staff_by_id.get(pid) if ptype == 1 else None)
+            if not person:
+                continue
+            viol, pcode, pdetail = _check_policy(t, hb, person)
+            if not viol:
+                continue
+            t_nat = int(t.get("nation", 0) or 0)
+            p_nat = int(person.get("nation", 0) or 0)
+            price = int(x.get("purchasePrice", 0) or 0)
+            dt_obj = x.get("datetime", {})
+            date_str = f"{dt_obj.get('year', 0)}-{int(dt_obj.get('month', 0)):02d}-{int(dt_obj.get('day', 0)):02d}"
+            from_id = int(x.get("fromTeamId", 0) or 0)
+            from_name = "Free Agent" if from_id == 0 else self.teams_by_id.get(from_id, {}).get("name", f"#{from_id}")
+            if ptype == 0:
+                policy_tx_players += 1
+                if pcode == "hb0":
+                    policy_hb0_players += 1
+                else:
+                    policy_hb1_players += 1
+            else:
+                policy_tx_staff += 1
+                if pcode == "hb0":
+                    policy_hb0_staff += 1
+                else:
+                    policy_hb1_staff += 1
+            policy_spend += price
+            key = (to_id, ptype, pid, pcode)
+            existing = policy_map.get(key)
+            if existing is None or price > existing["purchasePrice"]:
+                policy_map[key] = {
+                    "teamId": to_id,
+                    "teamName": t.get("name", f"Team #{to_id}"),
+                    "teamNation": NATIONS.get(t_nat, f"#{t_nat}"),
+                    "policyCode": pcode,
+                    "policyLabel": "Only National" if pcode == "hb0" else "Only National Lang",
+                    "policyDetail": pdetail,
+                    "personType": "Player" if ptype == 0 else "Staff",
+                    "personId": pid,
+                    "personName": person.get("name", f"#{pid}"),
+                    "personNation": NATIONS.get(p_nat, f"#{p_nat}"),
+                    "age": int(person.get("age", 0) or 0),
+                    "skill": _player_avg_skill(person) if ptype == 0 else _staff_avg_skill(person),
+                    "date": date_str,
+                    "route": f"{from_name} -> {t.get('name', '?')}",
+                    "purchasePrice": price,
+                    "activeOnTeam": False,
+                    "source": "Transfer",
+                }
+
+        active_staff_contracts = {int(c.get("staffId", 0)): c for c in self.data.get("staffContracts", {}).get("staffContracts", [])}
+        policy_active_players = 0
+        policy_active_staff = 0
+
+        for pid, c in self.player_contract_by_pid.items():
+            to_id = int(c.get("teamId", 0) or 0)
+            if to_id not in strict_teams:
+                continue
+            p = self.players_by_id.get(pid)
+            if not p:
+                continue
+            t, hb = strict_teams[to_id]
+            viol, pcode, pdetail = _check_policy(t, hb, p)
+            if not viol:
+                continue
+            t_nat, p_nat = int(t.get("nation", 0) or 0), int(p.get("nation", 0) or 0)
+            policy_active_players += 1
+            key = (to_id, 0, pid, pcode)
+            if key in policy_map:
+                policy_map[key]["activeOnTeam"] = True
+                policy_map[key]["source"] = "Signed + Active" + (" (Benched)" if c.get("benched") else "")
+            else:
+                policy_map[key] = {
+                    "teamId": to_id,
+                    "teamName": t.get("name", f"Team #{to_id}"),
+                    "teamNation": NATIONS.get(t_nat, f"#{t_nat}"),
+                    "policyCode": pcode,
+                    "policyLabel": "Only National" if pcode == "hb0" else "Only National Lang",
+                    "policyDetail": pdetail,
+                    "personType": "Player",
+                    "personId": pid,
+                    "personName": p.get("name", f"#{pid}"),
+                    "personNation": NATIONS.get(p_nat, f"#{p_nat}"),
+                    "age": int(p.get("age", 0) or 0),
+                    "skill": _player_avg_skill(p),
+                    "date": "Roster",
+                    "route": "Current Roster" + (" (Benched)" if c.get("benched") else ""),
+                    "purchasePrice": 0,
+                    "activeOnTeam": True,
+                    "source": "Active Contract",
+                }
+
+        for sid, c in active_staff_contracts.items():
+            to_id = int(c.get("teamId", 0) or 0)
+            if to_id not in strict_teams:
+                continue
+            s = self.staff_by_id.get(sid)
+            if not s:
+                continue
+            t, hb = strict_teams[to_id]
+            viol, pcode, pdetail = _check_policy(t, hb, s)
+            if not viol:
+                continue
+            t_nat, s_nat = int(t.get("nation", 0) or 0), int(s.get("nation", 0) or 0)
+            policy_active_staff += 1
+            key = (to_id, 1, sid, pcode)
+            if key in policy_map:
+                policy_map[key]["activeOnTeam"] = True
+                policy_map[key]["source"] = "Hired + Active"
+            else:
+                policy_map[key] = {
+                    "teamId": to_id,
+                    "teamName": t.get("name", f"Team #{to_id}"),
+                    "teamNation": NATIONS.get(t_nat, f"#{t_nat}"),
+                    "policyCode": pcode,
+                    "policyLabel": "Only National" if pcode == "hb0" else "Only National Lang",
+                    "policyDetail": pdetail,
+                    "personType": "Staff",
+                    "personId": sid,
+                    "personName": s.get("name", f"#{sid}"),
+                    "personNation": NATIONS.get(s_nat, f"#{s_nat}"),
+                    "age": int(s.get("age", 0) or 0),
+                    "skill": _staff_avg_skill(s),
+                    "date": "Roster",
+                    "route": "Current Staff",
+                    "purchasePrice": 0,
+                    "activeOnTeam": True,
+                    "source": "Active Staff",
+                }
+
+        policy_violations = sorted(
+            policy_map.values(),
+            key=lambda r: (
+                0 if r["personType"] == "Player" else 1,
+                -r["purchasePrice"],
+                0 if r["activeOnTeam"] else 1,
+                r["teamName"],
+            ),
+        )
+
+        return {
+            "totalPlayerTransfers": len(raw_transfers),
+            "flaggedTransfersCount": len(flagged_transfers),
+            "benchedOverStarterCount": len(benched_crimes),
+            "signedOverBetterBench": signed_over_better_bench,
+            "signedThenBenched": signed_then_benched,
+            "multiMovedEvents": multi_moved_count,
+            "totalWastedSpend": total_spend_wasted,
+            "benchedCrimes": benched_crimes,
+            "flaggedTransfers": flagged_transfers[:150],
+            "onlyNationalTeamCount": only_national_count,
+            "onlyLangTeamCount": only_lang_count,
+            "policyTxPlayers": policy_tx_players,
+            "policyTxStaff": policy_tx_staff,
+            "policyHb0Players": policy_hb0_players,
+            "policyHb0Staff": policy_hb0_staff,
+            "policyHb1Players": policy_hb1_players,
+            "policyHb1Staff": policy_hb1_staff,
+            "policyActivePlayers": policy_active_players,
+            "policyActiveStaff": policy_active_staff,
+            "policySpend": policy_spend,
+            "policyViolations": policy_violations[:280],
+            "rootCauses": [
+                {
+                    "title": "1. AI Hunts Transfer-Listed / Benched Vulture Targets",
+                    "symbol": "TeamAI Transfer Evaluation",
+                    "summary": "AI transfer scoring heavily discounts players sitting on another team's bench (`benched == true`) regardless of whether they actually upgrade the buyer's weakest role.",
+                },
+                {
+                    "title": "2. AI Benches Its Own Better Starter for Worse New Signing",
+                    "symbol": "Lineup Auto-Select / Contract Priority",
+                    "summary": "Recent signings or specific role/nationality/salary flags cause the manager AI to drop higher-skilled starters onto the bench (`JamYoung` -> `Zero`, `Techno` -> `REZ`), leaving them stranded until another vulture signs them.",
+                },
+                {
+                    "title": "3. 'Only National' & 'Only National Language' Ignored by AI",
+                    "symbol": "owner.hiringBias == 0 / 1",
+                    "summary": "Both strict national clubs (`hiringBias == 0`, e.g. The MongolZ buying REZ & KRIMZ) and language-locked clubs (`hiringBias == 1`, e.g. Haunted House / Kaleido / FengDa signing players who cannot speak the club's language) ignore their own transfer policy.",
+                },
+            ],
+        }
+
+    def _showcase_stability(self) -> dict[str, Any]:
+        """Measure post-transfer stint durations vs CS2 pro baselines (6-14 months avg, 6m low end) and team churn."""
+        assert self.data is not None
+
+        def _to_date(dt_obj: dict[str, Any]) -> dt.date | None:
+            y = int(dt_obj.get("year", 0) or 0)
+            m = int(dt_obj.get("month", 0) or 0)
+            d = int(dt_obj.get("day", 0) or 0)
+            if y <= 10 or m < 1 or m > 12:
+                return None
+            return dt.date(y, m, max(1, min(28, d)))
+
+        all_dates: list[dt.date] = []
+        team_player_dates: dict[tuple[int, int], list[dt.date]] = {}
+        for m in self.data.get("matches", {}).get("matches", []):
+            if not m.get("processingCompleted"):
+                continue
+            d = _to_date(m.get("datetime", {}))
+            if not d:
+                continue
+            all_dates.append(d)
+            t1, t2 = int(m.get("team1Id", 0) or 0), int(m.get("team2Id", 0) or 0)
+            for pid in m.get("team1PlayerIds", []):
+                team_player_dates.setdefault((int(pid), t1), []).append(d)
+            for pid in m.get("team2PlayerIds", []):
+                team_player_dates.setdefault((int(pid), t2), []).append(d)
+
+        raw_th = self.data.get("transferHistories", {}).get("transferHistories", [])
+        for x in raw_th:
+            d = _to_date(x.get("datetime", {}))
+            if d:
+                all_dates.append(d)
+
+        cur_date = max(all_dates) if all_dates else dt.date(2026, 12, 1)
+
+        p_tx = [x for x in raw_th if int(x.get("personType", -1)) == 0 and _to_date(x.get("datetime", {})) is not None]
+        p_tx.sort(key=lambda x: _to_date(x["datetime"]) or cur_date)
+
+        tx_by_pid: dict[int, list[dict[str, Any]]] = {}
+        churn: dict[int, dict[str, Any]] = {}
+
+        def _ch_bucket(tid: int) -> dict[str, Any]:
+            return churn.setdefault(tid, {"inP": 0, "outP": 0, "inS": 0, "spend": 0})
+
+        for x in p_tx:
+            pid = int(x.get("personId", 0))
+            tx_by_pid.setdefault(pid, []).append(x)
+            to_id = int(x.get("otherTeamId", 0) or 0)
+            from_id = int(x.get("fromTeamId", 0) or 0)
+            if to_id:
+                b = _ch_bucket(to_id)
+                b["inP"] += 1
+                b["spend"] += int(x.get("purchasePrice", 0) or 0)
+            if from_id:
+                _ch_bucket(from_id)["outP"] += 1
+
+        for x in raw_th:
+            if int(x.get("personType", -1)) == 1:
+                to_id = int(x.get("otherTeamId", 0) or 0)
+                if to_id:
+                    _ch_bucket(to_id)["inS"] += 1
+
+        stints: list[dict[str, Any]] = []
+        for pid, txs in tx_by_pid.items():
+            p = self.players_by_id.get(pid)
+            if not p:
+                continue
+            sk = _player_avg_skill(p)
+            c = self.player_contract_by_pid.get(pid)
+            for i, x in enumerate(txs):
+                d_in = _to_date(x["datetime"])
+                if not d_in:
+                    continue
+                to_id = int(x.get("otherTeamId", 0) or 0)
+                to_name = self.teams_by_id.get(to_id, {}).get("name", f"Team #{to_id}")
+                price = int(x.get("purchasePrice", 0) or 0)
+                played = sorted(team_player_dates.get((pid, to_id), []))
+                outcome = ""
+                d_end = d_in
+                active_days = 0
+                held_days = 0
+
+                if i + 1 < len(txs) and int(txs[i + 1].get("fromTeamId", 0) or 0) == to_id:
+                    d_end = _to_date(txs[i + 1]["datetime"]) or d_in
+                    active_days = max(0, (d_end - d_in).days)
+                    held_days = active_days
+                    next_name = self.teams_by_id.get(int(txs[i + 1].get("otherTeamId", 0) or 0), {}).get("name", "Next Club")
+                    outcome = f"Sold/Moved -> {next_name}"
+                elif c and int(c.get("teamId", 0) or 0) == to_id and c.get("benched"):
+                    d_end = max(played) if played else d_in
+                    active_days = max(0, (d_end - d_in).days)
+                    held_days = max(0, (cur_date - d_in).days)
+                    outcome = "Signed & Benched"
+                elif not c or int(c.get("teamId", 0) or 0) != to_id:
+                    d_end = max(played) if played else d_in
+                    active_days = max(0, (d_end - d_in).days)
+                    held_days = active_days
+                    outcome = "Dropped / Left Roster"
+                else:
+                    # Still an active starter — check if < 180d open ongoing only? Skip ended metrics unless ended
+                    continue
+
+                active_months = round(active_days / 30.44, 1)
+                pro_low_days = 180  # ~6 months (low end of 6-14 month CS2 pro average stint)
+                stints.append(
+                    {
+                        "playerId": pid,
+                        "playerName": p.get("name", f"Player #{pid}"),
+                        "skill": round(sk, 2),
+                        "teamId": to_id,
+                        "teamName": to_name,
+                        "fee": price,
+                        "signDate": d_in.isoformat(),
+                        "endDate": d_end.isoformat(),
+                        "activeDays": active_days,
+                        "activeMonths": active_months,
+                        "heldDays": held_days,
+                        "matchesPlayed": len(played),
+                        "outcome": outcome,
+                        "belowProLowEnd": active_days < pro_low_days,
+                        "proLowDiffMonths": round(6.0 - active_months, 1),
+                    }
+                )
+
+        stints.sort(key=lambda s: (s["activeDays"], -s["fee"]))
+
+        completed_cnt = len(stints)
+        sub6m_cnt = sum(1 for s in stints if s["activeDays"] < 180)
+        sub3m_cnt = sum(1 for s in stints if s["activeDays"] < 90)
+        days_list = sorted(s["activeDays"] for s in stints)
+        avg_days = round(sum(days_list) / completed_cnt, 1) if completed_cnt else 0.0
+        med_days = float(days_list[completed_cnt // 2]) if completed_cnt else 0.0
+        avg_months = round(avg_days / 30.44, 1) if completed_cnt else 0.0
+        med_months = round(med_days / 30.44, 1) if completed_cnt else 0.0
+
+        # Active bench counts per team for churn table
+        benched_by_tid: dict[int, int] = {}
+        active_by_tid: dict[int, int] = {}
+        for c in self.player_contract_by_pid.values():
+            tid = int(c.get("teamId", 0) or 0)
+            if c.get("benched"):
+                benched_by_tid[tid] = benched_by_tid.get(tid, 0) + 1
+            else:
+                active_by_tid[tid] = active_by_tid.get(tid, 0) + 1
+
+        team_churn_rows = []
+        carousel_teams = 0
+        for tid, st in churn.items():
+            tot_p = st["inP"] + st["outP"]
+            if tot_p >= 4:
+                carousel_teams += 1
+            if tot_p >= 2 or st["inS"] >= 4:
+                team_churn_rows.append(
+                    {
+                        "teamId": tid,
+                        "teamName": self.teams_by_id.get(tid, {}).get("name", f"Team #{tid}"),
+                        "playersIn": st["inP"],
+                        "playersOut": st["outP"],
+                        "totalPlayerMoves": tot_p,
+                        "staffIn": st["inS"],
+                        "spend": st["spend"],
+                        "startersNow": active_by_tid.get(tid, 0),
+                        "benchedNow": benched_by_tid.get(tid, 0),
+                    }
+                )
+        team_churn_rows.sort(key=lambda r: (-r["totalPlayerMoves"], -r["spend"], -r["staffIn"]))
+
+        return {
+            "completedStintsCount": completed_cnt,
+            "sub6MonthsCount": sub6m_cnt,
+            "sub6MonthsPct": round(sub6m_cnt * 100.0 / completed_cnt, 1) if completed_cnt else 0.0,
+            "sub3MonthsCount": sub3m_cnt,
+            "avgStintDays": avg_days,
+            "avgStintMonths": avg_months,
+            "medianStintDays": med_days,
+            "medianStintMonths": med_months,
+            "proLowEndMonths": 6.0,
+            "proMedianRange": "8 - 10 months",
+            "proFullRange": "6 - 14 months",
+            "carouselTeamsCount": carousel_teams,
+            "stints": stints[:150],
+            "teamChurn": team_churn_rows[:120],
+            "rootCauses": [
+                {
+                    "title": "1. Zero Post-Signing Protection / Sunk-Cost Memory",
+                    "symbol": "TeamAI Bench / Transfer Trigger",
+                    "summary": "After paying $125k-$400k for a player (e.g. device $400k -> 0 matches, VINI $250k -> 28d -> benched), AI immediately forgets the investment and benches or drops them weeks later.",
+                },
+                {
+                    "title": "2. Bench-Poaching Chain Reaction",
+                    "symbol": "Revolving-Door Orgs (4-8+ moves/yr)",
+                    "summary": "Because every team dumps decent starters onto the bench and vultures prioritize benched players, single teams burn through 5-8 player moves and 5-14 staff changes in one season, crushing average tenure well below the 6-month CS2 pro low end.",
+                },
+            ],
+        }
