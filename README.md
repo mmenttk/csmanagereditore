@@ -48,7 +48,7 @@ Start the server with `--lan` (for example `launch.bat --lan` or `python3 server
 
 ## virustotal result
 
-[virustotale]https://www.virustotal.com/gui/file/4ecf45066f021d64b82d79bc64cf731a25f6fbb172f9fe71fe43e18515f1d709?nocache=1
+https://www.virustotal.com/gui/file-analysis/ZjU2ZWNhZjMxMDg3MDJjNDMwNjcwNDJmZTk5OTIxNzQ6MTc5NDY4MTc1OA==
 
 ## Note Before Sharing With Others
 Keep your personal save files (e.g. `*.json`), `backups/`, and `__pycache__/` out of the zip when sharing this folder with other people—only `server.py`, `save_engine.py`, `gamedata.py`, `launch.bat`, `launch.sh`, `README.md`, and the `static/` folder are needed.
