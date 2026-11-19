@@ -1,0 +1,492 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>CS Manager — Database, Schedule &amp; Mod Studio</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-title">CS Manager Database Studio</span>
+      <span id="dbStatusBadge" class="badge-pill">No DB Loaded</span>
+      <span id="dirtyDbBadge" class="badge-pill dirty" style="display:none;">Unsaved DB Changes</span>
+    </div>
+    <div class="top-controls">
+      <label class="muted" style="font-size:11px;">DB:</label>
+      <select id="dbPackSelect" style="min-width:170px;"></select>
+      <button id="btnLoadDbPack" class="btn sm">Load</button>
+      <button id="btnBrowseDb" class="btn sm">Browse Folder...</button>
+      <button id="btnCloneDb" class="btn sm">Clone Copy</button>
+      <button id="btnSaveDb" class="btn ok sm">Save DB</button>
+    </div>
+  </header>
+
+  <nav class="nav-tabs">
+    <button class="tab-btn active" data-tab="overview">Overview &amp; Validator</button>
+    <button class="tab-btn" data-tab="teams">Teams</button>
+    <button class="tab-btn" data-tab="players">Players</button>
+    <button class="tab-btn" data-tab="staff">Staff &amp; Sponsors</button>
+    <button class="tab-btn" data-tab="tournaments">Tournaments &amp; Stages</button>
+    <button class="tab-btn" data-tab="schedule">Schedule Overlap Audit</button>
+    <button class="tab-btn" data-tab="datascience">DB Unbalance Science</button>
+    <button class="tab-btn" data-tab="mods">GameBalance &amp; Weapons Lab</button>
+    <button class="tab-btn" data-tab="godmode">God Mode DB Balancer</button>
+    <button class="tab-btn" data-tab="legend">Legend &amp; Awards Guide</button>
+  </nav>
+
+  <main class="main-wrap">
+    <!-- TAB 1: OVERVIEW & VALIDATOR -->
+    <section id="tab-overview" class="tab-panel active">
+      <div id="ovKpis" class="kpi-grid"></div>
+      <div class="split-equal">
+        <div class="card">
+          <div class="card-head">
+            <span class="card-title">Tournament Tier Distribution</span>
+            <span class="muted">Active templates in 6-month loop (runs Spring &amp; Fall)</span>
+          </div>
+          <div id="ovTierBreakdown"></div>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <span class="card-title">Database Integrity Validator</span>
+            <div style="display:flex;gap:6px;">
+              <button id="btnRunValidate" class="btn sm">Re-Check</button>
+              <button id="btnAutoFixDb" class="btn warn sm">Auto-Fix Safe Issues</button>
+            </div>
+          </div>
+          <div id="ovValSummary" class="muted" style="margin-bottom:8px;"></div>
+          <div class="table-wrap" style="max-height:360px;">
+            <table>
+              <thead><tr><th>Severity</th><th>Category</th><th>Detail</th></tr></thead>
+              <tbody id="ovValTable"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 2: TEAMS -->
+    <section id="tab-teams" class="tab-panel">
+      <div class="split-2">
+        <div class="card">
+          <div class="card-head">
+            <span class="card-title">Teams</span>
+            <button id="btnOpenNewTeam" class="btn primary sm">+ New Team</button>
+          </div>
+          <div style="display:flex;gap:6px;margin-bottom:8px;">
+            <input id="teamSearch" placeholder="Search team, nation, ID..." style="flex:1;" />
+            <select id="teamRegionFilter">
+              <option value="">All Regions</option>
+              <option value="0">EU</option>
+              <option value="1">Americas</option>
+              <option value="2">Asia</option>
+            </select>
+          </div>
+          <div id="teamList" class="list-scroll"></div>
+        </div>
+        <div class="card" id="teamEditorCard">
+          <div class="muted">Select a team on the left to inspect or edit.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 3: PLAYERS -->
+    <section id="tab-players" class="tab-panel">
+      <div class="split-2">
+        <div class="card">
+          <div class="card-head">
+            <span class="card-title">Players</span>
+            <button id="btnOpenNewPlayer" class="btn primary sm">+ New Player</button>
+          </div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;">
+            <input id="playerSearch" placeholder="Search name, team, ID..." style="flex:1;min-width:130px;" />
+            <select id="playerRoleFilter">
+              <option value="">All Roles</option>
+              <option value="igl">IGLs</option>
+              <option value="awp">AWPers</option>
+            </select>
+            <label style="display:flex;align-items:center;gap:4px;font-size:11.5px;">
+              <input type="checkbox" id="playerFreeOnly" /> Free Agents
+            </label>
+          </div>
+          <div id="playerList" class="list-scroll"></div>
+        </div>
+        <div class="card" id="playerEditorCard">
+          <div class="muted">Select a player on the left to inspect or edit.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 4: STAFF & SPONSORS -->
+    <section id="tab-staff" class="tab-panel">
+      <div class="subtabs">
+        <button class="subtab-btn active" data-stsub="staffers">Staff &amp; Coaches</button>
+        <button class="subtab-btn" data-stsub="sponsors">Sponsors</button>
+      </div>
+      <div id="stsub-staffers" class="subpanel active">
+        <div class="split-2">
+          <div class="card">
+            <div class="card-head">
+              <span class="card-title">Staff Directory</span>
+              <button id="btnOpenNewStaff" class="btn primary sm">+ New Staff</button>
+            </div>
+            <input id="staffSearch" placeholder="Search staff or team..." style="width:100%;margin-bottom:8px;" />
+            <div id="staffList" class="list-scroll"></div>
+          </div>
+          <div class="card" id="staffEditorCard">
+            <div class="muted">Select a staff member to edit.</div>
+          </div>
+        </div>
+      </div>
+      <div id="stsub-sponsors" class="subpanel">
+        <div class="card">
+          <div class="card-head">
+            <span class="card-title">Database Sponsors</span>
+            <div style="display:flex;gap:6px;">
+              <button id="btnImportSponsorLogos" class="btn sm">Import Sponsor Logos Folder</button>
+              <button id="btnNewSponsor" class="btn primary sm">+ New Sponsor</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>ID</th><th>Logo</th><th>Name</th><th>Rep</th><th>Monthly $</th><th>Bonus Req Top</th><th>Bonus Payout $</th><th>Actions</th></tr></thead>
+              <tbody id="sponsorsTable"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 5: TOURNAMENTS & STAGES -->
+    <section id="tab-tournaments" class="tab-panel">
+      <div class="split-2">
+        <div class="card">
+          <div class="card-head">
+            <span class="card-title">Tournaments</span>
+            <button id="btnOpenNewTournament" class="btn primary sm">+ New Tournament</button>
+          </div>
+          <div style="display:flex;gap:6px;margin-bottom:8px;">
+            <input id="tournSearch" placeholder="Search event or template..." style="flex:1;" />
+            <select id="tournTierFilter">
+              <option value="">All Tiers</option>
+              <option value="5">Major (T5)</option>
+              <option value="4">S-Tier (T4)</option>
+              <option value="3">A-Tier (T3)</option>
+              <option value="2">B-Tier (T2)</option>
+              <option value="1">C-Tier (T1)</option>
+            </select>
+          </div>
+          <div id="tournList" class="list-scroll"></div>
+        </div>
+        <div class="card" id="tournEditorCard">
+          <div class="muted">Select a tournament on the left to edit settings and stages.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 6: SCHEDULE OVERLAP AUDIT -->
+    <section id="tab-schedule" class="tab-panel">
+      <div id="schedKpis" class="kpi-grid"></div>
+      <div class="card">
+        <div class="card-head">
+          <span class="card-title">Tier-Split Overlap Validator (Engine Exact Date Simulation)</span>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;">
+            <select id="schedTierFilter">
+              <option value="all">All Tiers</option>
+              <option value="S">S-Tier &amp; Major (Rep 13-20)</option>
+              <option value="T5">Major Only (Rep 19-20)</option>
+              <option value="T4">S-Tier Only (Rep 13-18)</option>
+              <option value="T3">A-Tier Only (Rep 9-12)</option>
+              <option value="T2">B-Tier Only (Rep 5-8)</option>
+              <option value="T1">C-Tier Only (Rep 1-4)</option>
+            </select>
+            <select id="schedWhenFilter">
+              <option value="all">All Anchor Scenarios (1-7/7)</option>
+              <option value="always">Always Overlaps (7/7 Anchors)</option>
+              <option value="conditional">Weekday-Conditional (1-6/7 Anchors)</option>
+            </select>
+            <label style="display:flex;align-items:center;gap:4px;font-size:12px;">
+              <input type="checkbox" id="schedLanOnly" /> LAN Conflicts Only
+            </label>
+            <button id="btnRefreshSched" class="btn sm">Re-Simulate Calendar</button>
+          </div>
+        </div>
+
+        <div class="subtabs">
+          <button class="subtab-btn active" data-scsub="conflicts">7-Weekday Overlap Matrix</button>
+          <button class="subtab-btn" data-scsub="timeline">6-Month Gantt Timeline</button>
+          <button class="subtab-btn" data-scsub="tiers">Tier-by-Tier Breakdown</button>
+          <button class="subtab-btn" data-scsub="parallel">Safe Parallel Regionals &amp; Stage Errors</button>
+        </div>
+
+        <div id="scsub-conflicts" class="subpanel active">
+          <p class="muted" style="margin:0 0 8px;">Simulates every fixed <code>startMonthRange / startDayRange</code> against all <strong>7 calendar weekday anchors (Mon..Sun)</strong> combined with each stage's allowed <code>daysOfWeek</code> and Spring/Fall +6m wrap.</p>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Severity</th>
+                  <th>Scenario</th>
+                  <th>Event A</th>
+                  <th>Event B</th>
+                  <th>Weekdays (X/7)</th>
+                  <th>Trigger Anchors</th>
+                  <th>Max / LAN Overlap</th>
+                  <th>Slot Hits</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="schedConflictTable"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div id="scsub-timeline" class="subpanel">
+          <p class="muted" style="margin:0 0 8px;">CS Manager runs every tournament template on a 6-month loop (<code>startMonthRange 1..6</code> = Spring M1-M6, then mirrored +6 months for Fall M7-M12). Click any bar to inspect/adjust its dates or find clean slots.</p>
+          <div id="schedGantt" class="gantt-wrap"></div>
+        </div>
+
+        <div id="scsub-tiers" class="subpanel">
+          <div id="schedTierCards"></div>
+        </div>
+
+        <div id="scsub-parallel" class="subpanel">
+          <div class="split-equal">
+            <div class="subcard">
+              <div class="subcard-title">Internal Stage &amp; Bracket Chain Issues</div>
+              <div id="schedStageIssues"></div>
+            </div>
+            <div class="subcard">
+              <div class="subcard-title">Safe Parallel Regionals (Same Dates, Non-Overlapping Regions)</div>
+              <div class="table-wrap" style="max-height:380px;">
+                <table>
+                  <thead><tr><th>Tier</th><th>Event A</th><th>Event B</th><th>Window</th></tr></thead>
+                  <tbody id="schedParallelTable"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 7: DB UNBALANCE DATA SCIENCE -->
+    <section id="tab-datascience" class="tab-panel">
+      <div class="card">
+        <div class="card-head">
+          <span class="card-title">Database Balance &amp; Pre-Career Unbalance Audit</span>
+          <button id="btnRefreshDs" class="btn sm">Re-Run Audit</button>
+        </div>
+        <div id="dsKpis" class="kpi-grid"></div>
+        <div id="dsAlerts"></div>
+      </div>
+
+      <div class="subtabs">
+        <button class="subtab-btn active" data-dssub="dominance">Superteam Dominance (skill^2.8)</button>
+        <button class="subtab-btn" data-dssub="parity">Gini &amp; Regional Ecosystem</button>
+        <button class="subtab-btn" data-dssub="repfit">Reputation vs Skill Mismatches</button>
+        <button class="subtab-btn" data-dssub="outliers">Player Outliers &amp; Age Pyramid</button>
+      </div>
+
+      <div id="dssub-dominance" class="subpanel active">
+        <div class="card">
+          <div class="card-head">
+            <span class="card-title">Top-16 Pre-Career Engine Projection (GetOddsOfWinning skill^2.8 vs Top-10 Field)</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>#</th><th>Team</th><th>Region</th><th>Starter Avg</th><th>Floor (#5)</th>
+                  <th>Star (#1)</th><th>Pred Map% vs T10</th><th>Pred BO3% vs T10</th>
+                  <th>Proj S-Tier Trophy Share</th><th>Est. Trophies / 10 Events</th><th>Hiring Policy</th>
+                </tr>
+              </thead>
+              <tbody id="dsTop16Table"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div id="dssub-parity" class="subpanel">
+        <div class="split-equal">
+          <div class="card">
+            <div class="card-head"><span class="card-title">Gini &amp; Percentile Parity Spreads</span></div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Metric</th><th>Gini</th><th>Min</th><th>P10</th><th>P50</th><th>P90</th><th>Max</th></tr></thead>
+                <tbody id="dsGiniTable"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head"><span class="card-title">Regional Ecosystem Depth</span></div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Region</th><th>Teams</th><th>Top 30</th><th>T10 Avg</th><th>Players</th><th>15.5+ Stars</th><th>AWPs 14+</th><th>IGLs 14+</th><th>U20 Gems</th></tr></thead>
+                <tbody id="dsRegionTable"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="dssub-repfit" class="subpanel">
+        <div class="card">
+          <div class="card-head">
+            <span class="card-title">Reputation &amp; Ranking Rank Mismatches (Over-Hyped vs Underrated Teams)</span>
+            <span id="dsCorrTag" class="tag-pill info"></span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Team</th><th>Roster Avg Skill</th><th>Skill Rank</th><th>DB Rank (Points)</th><th>Rank Gap</th><th>DB Rep</th><th>Expected Rep</th><th>Rep Residual</th></tr></thead>
+              <tbody id="dsRepOutliersTable"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div id="dssub-outliers" class="subpanel">
+        <div class="split-2">
+          <div class="card">
+            <div class="card-head"><span class="card-title">Age Pyramid</span></div>
+            <div id="dsAgePyramid"></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><span class="card-title">Top-20 Highest-Rated Player Outliers</span></div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Player</th><th>Team</th><th>Age</th><th>Avg Skill</th><th>Potential</th><th>20-Maxed Stats</th><th>Salary</th></tr></thead>
+                <tbody id="dsPlayerOutliersTable"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 8: GAME BALANCE & WEAPONS MOD LAB -->
+    <section id="tab-mods" class="tab-panel">
+      <div class="subtabs">
+        <button class="subtab-btn active" data-msub="weapons-sci">Weapons Unbalance Science</button>
+        <button class="subtab-btn" data-msub="weapons-edit">Weapons Editor &amp; Batch Modder</button>
+        <button class="subtab-btn" data-msub="balance-edit">GameBalance Modder &amp; Economy Curve</button>
+      </div>
+
+      <div id="msub-weapons-sci" class="subpanel active">
+        <div class="card">
+          <div class="card-head">
+            <span class="card-title">Weapons Pack Unbalance Audit (TTK, DPS, Economy &amp; Engine Armor Bug Check)</span>
+            <div style="display:flex;gap:6px;align-items:center;">
+              <select id="weaponsPackSelect"></select>
+              <button id="btnLoadWeaponsPack" class="btn sm">Load Weapons</button>
+            </div>
+          </div>
+          <div id="wepKpis" class="kpi-grid"></div>
+          <div id="wepAlerts"></div>
+          <div class="subcard" style="margin-top:8px;">
+            <div class="subcard-title">CT vs T Side Symmetry</div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Side Pool</th><th>Count</th><th>Avg Price</th><th>Avg Armored DPS</th><th>Avg Armored Chest TTK</th><th>Avg Accuracy</th></tr></thead>
+                <tbody id="wepSideTable"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="table-wrap" style="margin-top:8px;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Weapon</th><th>Type</th><th>Side</th><th>$ Price</th><th>Dmg</th><th>Armor Pen</th>
+                  <th>RPM</th><th>Armored DPS</th><th>STK (Armor)</th><th>TTK (ms)</th>
+                  <th>Intended HS</th><th>Engine Armor Hit*</th><th>Value/$1k</th><th>Z-Score</th><th>Flags</th>
+                </tr>
+              </thead>
+              <tbody id="wepSciTable"></tbody>
+            </table>
+          </div>
+          <p class="muted" style="margin:6px 0 0;font-size:11.5px;">*Note from decompiled <code>Weapon::CalculateDamage</code>: in the current match engine, helmeted/armored hits overwrite damage to <code>damage * armorMultiplier</code> instead of applying <code>hsMultiplier</code>. Both Intended HS and Engine Armor Hit values are shown above.</p>
+        </div>
+      </div>
+
+      <div id="msub-weapons-edit" class="subpanel">
+        <div class="card">
+          <div class="card-head">
+            <span class="card-title">Weapons Editor</span>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;">
+              <button id="btnCloneWeapons" class="btn sm">Save As New Pack...</button>
+              <button id="btnSaveWeapons" class="btn ok sm">Save weapons.json</button>
+            </div>
+          </div>
+          <div class="subcard" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
+            <strong>Batch Balance Tool:</strong>
+            <select id="wepBatchAction">
+              <option value="scale_price">Scale Price %</option>
+              <option value="scale_damage">Scale Base Damage %</option>
+              <option value="scale_armor_pen">Scale Armor Penetration %</option>
+              <option value="scale_accuracy">Scale Accuracy %</option>
+            </select>
+            <select id="wepBatchType">
+              <option value="">All Weapon Types</option>
+              <option value="0">Pistols</option>
+              <option value="1">SMGs</option>
+              <option value="2">Rifles</option>
+              <option value="3">Snipers</option>
+            </select>
+            <input id="wepBatchPct" type="number" step="5" value="10" style="width:80px;" /> %
+            <button id="btnApplyWeaponBatch" class="btn warn sm">Apply Batch Scale</button>
+          </div>
+          <div class="split-2">
+            <div id="weaponList" class="list-scroll"></div>
+            <div id="weaponEditorCard" class="subcard"><div class="muted">Select a weapon to edit.</div></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="msub-balance-edit" class="subpanel">
+        <div class="card">
+          <div class="card-head">
+            <span class="card-title">GameBalance Pack Modder &amp; Economic Curve Analysis</span>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+              <select id="balancePackSelect"></select>
+              <button id="btnLoadBalancePack" class="btn sm">Load Balance</button>
+              <button id="btnCloneBalance" class="btn sm">Save As New Pack...</button>
+              <button id="btnSaveBalance" class="btn ok sm">Save gameBalance.json</button>
+            </div>
+          </div>
+          <div id="balKpis" class="kpi-grid"></div>
+          <div id="balAlerts"></div>
+          <div id="balEditorBody"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 9: LEGEND & AWARDS GUIDE -->
+    <section id="tab-legend" class="tab-panel">
+      <div id="legendBody"></div>
+    </section>
+
+    <!-- TAB 10: GOD MODE DB BALANCER -->
+    <section id="tab-godmode" class="tab-panel">
+      <div id="godModeBody"></div>
+    </section>
+  </main>
+
+  <!-- REUSABLE MODAL -->
+  <div id="modalBackdrop" class="modal-backdrop">
+    <div id="modalCard" class="modal-card">
+      <div class="card-head">
+        <span id="modalTitle" class="card-title">Modal</span>
+        <button id="btnCloseModal" class="btn sm">Close</button>
+      </div>
+      <div id="modalBody"></div>
+    </div>
+  </div>
+
+  <input type="file" id="logoFolderFileInput" webkitdirectory multiple accept="image/*" hidden />
+  <div id="toast" class="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

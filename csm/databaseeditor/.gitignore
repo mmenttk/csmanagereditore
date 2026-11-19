@@ -1,0 +1,49 @@
+# Database backups and personal JSON packs
+backups/
+**/backups/
+EDITORBACKUP/
+*_backup/
+tmp/
+temp/
+logs/
+*.log
+*.json
+
+# Imported custom logos, icons, and assets
+CustomTeamLogos/
+CustomTournamentLogos/
+CustomSponsorLogos/
+CustomWeaponIcons/
+CustomWeaponSkins/
+CustomIcons/
+CustomSounds/
+TeamLogos/
+TournamentLogos/
+SponsorLogos/
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.wav
+*.ogg
+*.mp3
+
+# Python bytecode, virtualenvs, and local caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# OS & editor artifacts
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
