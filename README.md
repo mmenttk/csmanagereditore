@@ -50,3 +50,6 @@ Open `http://127.0.0.1:8765`, pick a discovered save or upload a `.json` save fi
 
 - Every write creates a timestamped backup inside a local `backups/` folder before modifying files on disk.
 - `.gitignore` excludes `*.json` save/database files, `backups/`, `EDITORBACKUP/`, imported custom logo/asset folders, virtual environments, and Python caches so personal game data stays private when pushing to GitHub.
+
+## VirusTotal Result
+https://www.virustotal.com/gui/file/c3794a4fbf53fec82acf46641cff1b06b61934b800957268447b60875cfa3f43?nocache=1
