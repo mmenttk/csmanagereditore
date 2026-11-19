@@ -194,3 +194,11 @@ PERSONALITY_AXES = [
     {"key": "desireToIgl", "label": "Desire to IGL", "low": "Low", "high": "High"},
     {"key": "desireToAwp", "label": "Desire to AWP", "low": "Low", "high": "High"},
 ]
+
+RELATIONSHIP_TYPES = {
+    0: "Rival",
+    1: "Friend",
+    2: "Mentor / Former Teammate",
+    3: "Strong Bond",
+    4: "Chemistry Link",
+}

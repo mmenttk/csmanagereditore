@@ -1,14 +1,49 @@
-# Save backups & personal saves (contains ~50MB JSON saves)
+# Personal saves, custom database packs, and backups
 backups/
+**/backups/
+EDITORBACKUP/
+*_backup/
+tmp/
+temp/
+logs/
+*.log
 *.json
 
-# Python bytecode cache
+# Imported custom logos, icons, portraits, and sounds
+CustomTeamLogos/
+CustomTournamentLogos/
+CustomSponsorLogos/
+CustomWeaponIcons/
+CustomWeaponSkins/
+CustomIcons/
+CustomSounds/
+TeamLogos/
+TournamentLogos/
+SponsorLogos/
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.wav
+*.ogg
+*.mp3
+
+# Python bytecode, virtualenvs, and local caches
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
 
 # OS & editor artifacts
 .DS_Store
 Thumbs.db
+Desktop.ini
 .vscode/
 .idea/
+*.swp
+*.swo

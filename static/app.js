@@ -37,6 +37,10 @@ const state = {
   statsTeamSortKey: "worldRank",
   statsTeamSortDir: 1,
   top20VotePlayerId: null,
+  eventStatsData: null,
+  eventStatsSortKey: "fairRank",
+  eventStatsSortDir: 1,
+  selectedEventId: null,
 
   // Bug Showcase
   showcaseData: null,
@@ -151,6 +155,8 @@ async function refreshSavePicker() {
 function renderStatusBar() {
   const bar = $("statusBar");
   const s = state.summary;
+  const snapBadge = $("snapCountBadge");
+  if (snapBadge) snapBadge.textContent = String(s?.snapshotCount ?? 0);
   if (!s || !s.path) {
     bar.innerHTML = `<span class="muted">No save loaded. Select a save file above and click Load.</span>`;
     return;
@@ -189,10 +195,13 @@ async function refreshSummaryOnly() {
 
 async function refreshAllViews() {
   state.statsData = null;
+  state.eventStatsData = null;
+  state.selectedEventId = null;
   state.showcaseData = null;
   state.realismData = null;
   state.helperData = null;
   state.godModeData = null;
+  if (window.studioResetLazyCaches) window.studioResetLazyCaches();
   const tRes = await api("/api/teams");
   state.teams = tRes.teams || [];
 
@@ -211,8 +220,8 @@ async function refreshAllViews() {
     await loadStrengthRealism();
   } else if (state.activeTab === "helper") {
     await loadManagerHelper();
-  } else if (state.activeTab === "godmode") {
-    await loadGodMode();
+  } else if (window.studioOnTabActivated) {
+    await window.studioOnTabActivated(state.activeTab);
   }
 
   if (state.selectedPlayerId) {
@@ -678,7 +687,38 @@ async function loadPlayersList() {
   $("playersNext").disabled = state.playerOffset + state.playerLimit >= res.total;
 }
 
+function relTypeOptionsHtml(selectedVal = 1) {
+  return enumEntries(state.meta?.relationshipTypes || {})
+    .map(([k, v]) => `<option value="${k}" ${String(k) === String(selectedVal) ? "selected" : ""}>${escapeHtml(v)}</option>`)
+    .join("");
+}
+
+async function ensureAllPlayersCached() {
+  if (state.txAllPlayers && state.txAllPlayers.length) return state.txAllPlayers;
+  const pRes = await api("/api/players?limit=5000");
+  state.txAllPlayers = pRes.items || [];
+  return state.txAllPlayers;
+}
+
+function populatePlayerSearchSelect(selectEl, q = "", excludeId = 0, preferredId = 0) {
+  const ql = String(q || "").trim().toLowerCase();
+  const prev = String(preferredId || selectEl.value || "");
+  const list = (state.txAllPlayers || [])
+    .filter((pl) => pl.id !== excludeId)
+    .filter((pl) => !ql || pl.name.toLowerCase().includes(ql) || pl.teamName.toLowerCase().includes(ql) || String(pl.id) === ql)
+    .slice(0, 150);
+  selectEl.innerHTML = list.length
+    ? list
+        .map(
+          (pl) =>
+            `<option value="${pl.id}" ${String(pl.id) === prev ? "selected" : ""}>${escapeHtml(pl.name)} (${escapeHtml(pl.teamName)}, Avg ${pl.avgSkill}) [#${pl.id}]</option>`
+        )
+        .join("")
+    : `<option value="">No matching players</option>`;
+}
+
 async function openPlayerEditor(playerId) {
+  await ensureAllPlayersCached();
   state.selectedPlayerId = playerId;
   const data = await api(`/api/player/${playerId}`);
   state.selectedPlayerData = data;
@@ -849,6 +889,56 @@ async function openPlayerEditor(playerId) {
       <div class="subcard-title">Personality (1-20)</div>
       <div class="pers-grid">${persHtml}</div>
     </div>
+
+    <div class="subcard">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:8px;flex-wrap:wrap;">
+        <div class="subcard-title" style="margin:0;">Player Relations — Friends &amp; Rivals (${(data.relationships || []).length})</div>
+        <button type="button" class="btn btn-sm btn-blue" id="btnPEOpenGlobalRel">Open Relations Manager</button>
+      </div>
+      <div class="table-wrap" style="max-height:240px;margin-bottom:10px;">
+        <table>
+          <thead>
+            <tr>
+              <th>Other Player</th>
+              <th>Team</th>
+              <th>Type</th>
+              <th>Duration</th>
+              <th>Self Res</th>
+              <th>Other Res</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="pRelTableBody"></tbody>
+        </table>
+      </div>
+      <div class="form-grid" style="align-items:end;">
+        <div class="field">
+          <label>Filter Partner Name / Team</label>
+          <input id="pRelPartnerSearch" type="text" placeholder="Type name, team, or ID..." />
+        </div>
+        <div class="field">
+          <label>Partner Player</label>
+          <select id="pRelPartnerSelect"></select>
+        </div>
+        <div class="field">
+          <label>Relationship Type</label>
+          <select id="pRelNewType">${relTypeOptionsHtml(1)}</select>
+        </div>
+        <div class="field">
+          <label>Duration (0 = Perm)</label>
+          <input id="pRelNewDuration" type="number" min="0" step="1" value="0" />
+        </div>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-top:8px;">
+        <div class="inline-actions">
+          <label class="checkbox-row"><input id="pRelNewSelfRes" type="checkbox" /><span>Self Resolved</span></label>
+          <label class="checkbox-row"><input id="pRelNewOtherRes" type="checkbox" /><span>Other Resolved</span></label>
+        </div>
+        <button type="button" class="btn btn-sm btn-primary" id="btnAddPlayerRel">+ Add / Update Relation</button>
+      </div>
+    </div>
+
+    <div id="playerProExtras"></div>
   `;
 
   populateSelect($("pContractType"), enumEntries(state.meta.contractType), c ? c.contractType : 0);
@@ -887,6 +977,116 @@ async function openPlayerEditor(playerId) {
   $("btnPAll20").addEventListener("click", () => {
     $("playerEditorBody").querySelectorAll(".p-skill, .p-pot").forEach((i) => (i.value = "20"));
   });
+
+  // Relations wiring for selected player
+  const rels = data.relationships || [];
+  $("pRelTableBody").innerHTML = rels.length
+    ? rels
+        .map(
+          (r) => `
+      <tr data-other="${r.otherPlayerId}">
+        <td>
+          ${
+            r.otherExists
+              ? `<button type="button" class="btn btn-sm p-rel-jump" data-pid="${r.otherPlayerId}">${escapeHtml(r.otherPlayerName)}</button>`
+              : `<span class="muted">${escapeHtml(r.otherPlayerName)}</span>`
+          }
+        </td>
+        <td class="muted">${escapeHtml(r.otherTeamName)}</td>
+        <td><select class="p-rel-row-type" style="min-width:160px;">${relTypeOptionsHtml(r.type)}</select></td>
+        <td><input type="number" min="0" step="1" class="p-rel-row-dur" style="width:76px;" value="${r.duration}" /></td>
+        <td style="text-align:center;"><input type="checkbox" class="p-rel-row-sres" ${r.selfResolved ? "checked" : ""} /></td>
+        <td style="text-align:center;"><input type="checkbox" class="p-rel-row-ores" ${r.otherResolved ? "checked" : ""} /></td>
+        <td>
+          <div class="inline-actions">
+            <button type="button" class="btn btn-sm btn-primary p-rel-save" data-other="${r.otherPlayerId}">Save</button>
+            <button type="button" class="btn btn-sm btn-danger p-rel-del" data-other="${r.otherPlayerId}">Remove</button>
+          </div>
+        </td>
+      </tr>`
+        )
+        .join("")
+    : `<tr><td colspan="7" class="muted" style="text-align:center;padding:12px;">No friends or rivals set for this player.</td></tr>`;
+
+  populatePlayerSearchSelect($("pRelPartnerSelect"), "", p.id, 0);
+  $("pRelPartnerSearch").addEventListener("input", () => {
+    populatePlayerSearchSelect($("pRelPartnerSelect"), $("pRelPartnerSearch").value, p.id, 0);
+  });
+
+  $("pRelTableBody").querySelectorAll(".p-rel-jump").forEach((btn) => {
+    btn.addEventListener("click", () => openPlayerEditor(Number(btn.dataset.pid)));
+  });
+
+  $("pRelTableBody").querySelectorAll(".p-rel-save").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const tr = btn.closest("tr");
+      const otherId = Number(btn.dataset.other);
+      try {
+        await api("/api/player/relationship/save", {
+          method: "POST",
+          body: JSON.stringify({
+            player1Id: p.id,
+            player2Id: otherId,
+            type: Number(tr.querySelector(".p-rel-row-type").value),
+            duration: Number(tr.querySelector(".p-rel-row-dur").value || 0),
+            player1Resolved: tr.querySelector(".p-rel-row-sres").checked,
+            player2Resolved: tr.querySelector(".p-rel-row-ores").checked,
+          }),
+        });
+        await refreshSummaryOnly();
+        await openPlayerEditor(p.id);
+        toast("Updated player relation in save!", "ok");
+      } catch (err) {
+        toast(`Failed to update relation: ${err.message}`, "err");
+      }
+    });
+  });
+
+  $("pRelTableBody").querySelectorAll(".p-rel-del").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const otherId = Number(btn.dataset.other);
+      try {
+        await api("/api/player/relationship/delete", {
+          method: "POST",
+          body: JSON.stringify({ player1Id: p.id, player2Id: otherId }),
+        });
+        await refreshSummaryOnly();
+        await openPlayerEditor(p.id);
+        toast("Removed relation from save.", "ok");
+      } catch (err) {
+        toast(`Failed to remove relation: ${err.message}`, "err");
+      }
+    });
+  });
+
+  $("btnAddPlayerRel").addEventListener("click", async () => {
+    const otherId = Number($("pRelPartnerSelect").value || 0);
+    if (!otherId) {
+      toast("Select a partner player first.", "err");
+      return;
+    }
+    try {
+      await api("/api/player/relationship/save", {
+        method: "POST",
+        body: JSON.stringify({
+          player1Id: p.id,
+          player2Id: otherId,
+          type: Number($("pRelNewType").value),
+          duration: Number($("pRelNewDuration").value || 0),
+          player1Resolved: $("pRelNewSelfRes").checked,
+          player2Resolved: $("pRelNewOtherRes").checked,
+        }),
+      });
+      await refreshSummaryOnly();
+      await openPlayerEditor(p.id);
+      toast("Saved player relation! Remember to Save Savefile to write to disk.", "ok");
+    } catch (err) {
+      toast(`Failed to add relation: ${err.message}`, "err");
+    }
+  });
+
+  $("btnPEOpenGlobalRel").addEventListener("click", () => openRelationsModal(p.id));
+  if (window.studioRenderPlayerPro) window.studioRenderPlayerPro(p, data);
 }
 
 function renderLangRows(container, langs) {
@@ -1004,6 +1204,16 @@ async function applyPlayerChanges() {
       mapPositionAttributes,
       mapOpinions,
       personality,
+      ...($("pUseStartPot")
+        ? {
+            useStartingPotential: $("pUseStartPot").checked,
+            startingPotential: Number($("pStartPot").value || 150),
+            burnout: {
+              burnoutFromPractice: Number($("pBurnPrac").value || 0),
+              burnoutFromMatches: Number($("pBurnMatch").value || 0),
+            },
+          }
+        : {}),
     },
     contract: contractPayload,
   };
@@ -1020,6 +1230,106 @@ async function applyPlayerChanges() {
   } catch (err) {
     toast(`Failed to update player: ${err.message}`, "err");
   }
+}
+
+async function openRelationsModal(focusPlayerId = 0) {
+  await ensureAllPlayersCached();
+  $("rmNewType").innerHTML = relTypeOptionsHtml(1);
+  $("rmFilterType").innerHTML = `<option value="">All Relation Types</option>${relTypeOptionsHtml("")}`;
+  $("rmFilterTeam").innerHTML = [
+    `<option value="">All Teams</option>`,
+    ...state.teams.map((t) => `<option value="${t.id}">${escapeHtml(t.name)}</option>`),
+  ].join("");
+  $("rmP1Search").value = "";
+  $("rmP2Search").value = "";
+  populatePlayerSearchSelect($("rmP1Select"), "", 0, focusPlayerId || 0);
+  populatePlayerSearchSelect($("rmP2Select"), "", focusPlayerId || 0, 0);
+  $("relationsModal").classList.add("open");
+  await loadRelationsModalTable();
+}
+
+async function loadRelationsModalTable() {
+  const params = new URLSearchParams({
+    q: $("rmFilterQ").value.trim(),
+    type: $("rmFilterType").value,
+    team_id: $("rmFilterTeam").value,
+    unresolved_only: $("rmFilterUnresolved").checked ? "1" : "0",
+  });
+  const data = await api(`/api/player-relationships?${params.toString()}`);
+  $("relModalSummary").textContent = `${data.total} matching relation(s) shown`;
+  const rows = data.items || [];
+  $("rmTableBody").innerHTML = rows.length
+    ? rows
+        .map(
+          (r) => `
+      <tr data-p1="${r.player1Id}" data-p2="${r.player2Id}">
+        <td><strong>${escapeHtml(r.player1Name)}</strong> <span class="muted">(${escapeHtml(r.player1TeamName)})</span></td>
+        <td><strong>${escapeHtml(r.player2Name)}</strong> <span class="muted">(${escapeHtml(r.player2TeamName)})</span></td>
+        <td><select class="rm-row-type" style="min-width:165px;">${relTypeOptionsHtml(r.type)}</select></td>
+        <td><input type="number" min="0" step="1" class="rm-row-dur" style="width:76px;" value="${r.duration}" /></td>
+        <td style="text-align:center;"><input type="checkbox" class="rm-row-p1res" ${r.player1Resolved ? "checked" : ""} /></td>
+        <td style="text-align:center;"><input type="checkbox" class="rm-row-p2res" ${r.player2Resolved ? "checked" : ""} /></td>
+        <td>
+          <div class="inline-actions">
+            <button type="button" class="btn btn-sm btn-primary rm-row-save">Save</button>
+            <button type="button" class="btn btn-sm btn-danger rm-row-del">Delete</button>
+          </div>
+        </td>
+      </tr>`
+        )
+        .join("")
+    : `<tr><td colspan="7" class="muted" style="text-align:center;padding:16px;">No relationships match current filters.</td></tr>`;
+
+  $("rmTableBody").querySelectorAll(".rm-row-save").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const tr = btn.closest("tr");
+      const p1 = Number(tr.dataset.p1);
+      const p2 = Number(tr.dataset.p2);
+      try {
+        await api("/api/player/relationship/save", {
+          method: "POST",
+          body: JSON.stringify({
+            player1Id: p1,
+            player2Id: p2,
+            type: Number(tr.querySelector(".rm-row-type").value),
+            duration: Number(tr.querySelector(".rm-row-dur").value || 0),
+            player1Resolved: tr.querySelector(".rm-row-p1res").checked,
+            player2Resolved: tr.querySelector(".rm-row-p2res").checked,
+          }),
+        });
+        await refreshSummaryOnly();
+        await loadRelationsModalTable();
+        if (state.selectedPlayerId && (state.selectedPlayerId === p1 || state.selectedPlayerId === p2)) {
+          await openPlayerEditor(state.selectedPlayerId);
+        }
+        toast("Saved relation changes!", "ok");
+      } catch (err) {
+        toast(`Failed: ${err.message}`, "err");
+      }
+    });
+  });
+
+  $("rmTableBody").querySelectorAll(".rm-row-del").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const tr = btn.closest("tr");
+      const p1 = Number(tr.dataset.p1);
+      const p2 = Number(tr.dataset.p2);
+      try {
+        await api("/api/player/relationship/delete", {
+          method: "POST",
+          body: JSON.stringify({ player1Id: p1, player2Id: p2 }),
+        });
+        await refreshSummaryOnly();
+        await loadRelationsModalTable();
+        if (state.selectedPlayerId && (state.selectedPlayerId === p1 || state.selectedPlayerId === p2)) {
+          await openPlayerEditor(state.selectedPlayerId);
+        }
+        toast("Deleted player relation.", "ok");
+      } catch (err) {
+        toast(`Failed: ${err.message}`, "err");
+      }
+    });
+  });
 }
 
 // =========================================================================
@@ -1401,6 +1711,8 @@ async function openTeamEditor(teamId) {
         ${staffHtml || '<span class="muted">No staff contracted.</span>'}
       </div>
     </div>
+
+    <div id="teamProExtras"></div>
   `;
 
   populateSelect($("tProfStatus"), enumEntries(state.meta.professionalStatus), t.professionalStatus ?? 0);
@@ -1424,6 +1736,8 @@ async function openTeamEditor(teamId) {
       }
     });
   });
+
+  if (window.studioRenderTeamPro) window.studioRenderTeamPro(data);
 }
 
 async function applyTeamChanges() {
@@ -1488,26 +1802,32 @@ async function applyTeamChanges() {
 // Bootstrap & Event Wiring
 // =========================================================================
 
+function switchMainTab(tabName) {
+  const btn = document.querySelector(`.tab-btn[data-tab="${tabName}"]`);
+  const panel = $(`tab-${tabName}`);
+  if (!btn || !panel) return;
+  document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
+  document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
+  btn.classList.add("active");
+  panel.classList.add("active");
+  state.activeTab = tabName;
+  if (!state.summary?.path && !state.summary?.filename) return;
+  if (tabName === "stats" && !state.statsData) {
+    loadStatsOverview();
+  } else if (tabName === "showcase" && !state.showcaseData) {
+    loadBugShowcase();
+  } else if (tabName === "realism" && !state.realismData) {
+    loadStrengthRealism();
+  } else if (tabName === "helper" && !state.helperData) {
+    loadManagerHelper();
+  } else if (window.studioOnTabActivated) {
+    window.studioOnTabActivated(tabName);
+  }
+}
+
 function bindEvents() {
   document.querySelectorAll(".tab-btn").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
-      document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
-      btn.classList.add("active");
-      $(`tab-${btn.dataset.tab}`).classList.add("active");
-      state.activeTab = btn.dataset.tab;
-      if (state.activeTab === "stats" && !state.statsData && state.summary?.path) {
-        loadStatsOverview();
-      } else if (state.activeTab === "showcase" && !state.showcaseData && state.summary?.path) {
-        loadBugShowcase();
-      } else if (state.activeTab === "realism" && !state.realismData && state.summary?.path) {
-        loadStrengthRealism();
-      } else if (state.activeTab === "helper" && !state.helperData && state.summary?.path) {
-        loadManagerHelper();
-      } else if (state.activeTab === "godmode" && !state.godModeData && state.summary?.path) {
-        loadGodMode();
-      }
-    });
+    btn.addEventListener("click", () => switchMainTab(btn.dataset.tab));
   });
 
   $("btnLoadSelected").addEventListener("click", () => {
@@ -1594,7 +1914,45 @@ function bindEvents() {
 
   $("btnDownloadSave").addEventListener("click", triggerSaveDownload);
 
-  // New Player / New Staff Modals
+  // New Player / New Staff Modals & Relations Manager
+  $("btnOpenRelationsModal").addEventListener("click", () => openRelationsModal(state.selectedPlayerId || 0));
+  $("btnCloseRelationsModal").addEventListener("click", () => $("relationsModal").classList.remove("open"));
+  $("rmP1Search").addEventListener("input", () => populatePlayerSearchSelect($("rmP1Select"), $("rmP1Search").value, 0, 0));
+  $("rmP2Search").addEventListener("input", () => populatePlayerSearchSelect($("rmP2Select"), $("rmP2Search").value, 0, 0));
+  $("rmFilterQ").addEventListener("input", loadRelationsModalTable);
+  $("rmFilterType").addEventListener("change", loadRelationsModalTable);
+  $("rmFilterTeam").addEventListener("change", loadRelationsModalTable);
+  $("rmFilterUnresolved").addEventListener("change", loadRelationsModalTable);
+  $("btnRmAddSave").addEventListener("click", async () => {
+    const p1 = Number($("rmP1Select").value || 0);
+    const p2 = Number($("rmP2Select").value || 0);
+    if (!p1 || !p2) {
+      toast("Pick both Player 1 and Player 2 first.", "err");
+      return;
+    }
+    try {
+      await api("/api/player/relationship/save", {
+        method: "POST",
+        body: JSON.stringify({
+          player1Id: p1,
+          player2Id: p2,
+          type: Number($("rmNewType").value),
+          duration: Number($("rmNewDuration").value || 0),
+          player1Resolved: $("rmNewP1Resolved").checked,
+          player2Resolved: $("rmNewP2Resolved").checked,
+        }),
+      });
+      await refreshSummaryOnly();
+      await loadRelationsModalTable();
+      if (state.selectedPlayerId && (state.selectedPlayerId === p1 || state.selectedPlayerId === p2)) {
+        await openPlayerEditor(state.selectedPlayerId);
+      }
+      toast("Saved player relation! Remember to Save to write to disk.", "ok");
+    } catch (err) {
+      toast(`Failed: ${err.message}`, "err");
+    }
+  });
+
   $("btnOpenNewPlayer").addEventListener("click", openNewPlayerModal);
   $("btnCloseNewPlayerModal").addEventListener("click", () => $("newPlayerModal").classList.remove("open"));
   $("btnCancelNewPlayer").addEventListener("click", () => $("newPlayerModal").classList.remove("open"));
@@ -1698,6 +2056,9 @@ function bindEvents() {
       document.querySelectorAll("#tab-stats .subtab-panel").forEach((p) => p.classList.remove("active"));
       btn.classList.add("active");
       $(`subtab-${btn.dataset.subtab}`).classList.add("active");
+      if (btn.dataset.subtab === "events" && !state.eventStatsData && state.summary?.path) {
+        loadEventStats();
+      }
     });
   });
 
@@ -1793,11 +2154,39 @@ function bindEvents() {
     $(btnId).addEventListener("click", () => runGodModeAction(act, isDry));
   });
 
-  $("btnStatsRefresh").addEventListener("click", loadStatsOverview);
+  $("btnStatsRefresh").addEventListener("click", () => {
+    loadStatsOverview();
+    if ($("subtab-events").classList.contains("active") || state.eventStatsData) {
+      loadEventStats(state.selectedEventId);
+    }
+  });
   $("statsFilterYear").addEventListener("change", loadStatsOverview);
-  $("statsFilterTeam").addEventListener("change", loadStatsOverview);
+  $("statsFilterTeam").addEventListener("change", () => {
+    loadStatsOverview();
+    if (state.eventStatsData) renderEventStats();
+  });
   $("statsFilterMinMaps").addEventListener("change", loadStatsOverview);
   $("statsFilterQ").addEventListener("input", renderStatsTables);
+  $("statsEventSelect").addEventListener("change", () => {
+    const tid = Number($("statsEventSelect").value || 0);
+    state.selectedEventId = tid || null;
+    loadEventStats(state.selectedEventId);
+  });
+  $("btnEventStatsRefresh").addEventListener("click", () => loadEventStats(state.selectedEventId));
+
+  document.querySelectorAll("th[data-esort]").forEach((th) => {
+    th.addEventListener("click", () => {
+      const k = th.dataset.esort;
+      if (state.eventStatsSortKey === k) state.eventStatsSortDir *= -1;
+      else {
+        state.eventStatsSortKey = k;
+        state.eventStatsSortDir = ["fairRank", "gameRank", "playerName", "teamName", "placement", "avgOppRank"].includes(k) ? 1 : -1;
+      }
+      document.querySelectorAll("th[data-esort]").forEach((x) => x.classList.remove("sort-active"));
+      th.classList.add("sort-active");
+      renderEventStatsTable();
+    });
+  });
 
   document.querySelectorAll("th[data-sort]").forEach((th) => {
     th.addEventListener("click", () => {
@@ -1830,6 +2219,7 @@ function bindEvents() {
   $("btnClosePsModal").addEventListener("click", () => $("playerStatsModal").classList.remove("open"));
   $("btnCloseTsModal").addEventListener("click", () => $("teamStatsModal").classList.remove("open"));
   $("btnCloseMsModal").addEventListener("click", () => $("matchStatsModal").classList.remove("open"));
+  $("btnCloseTbModal").addEventListener("click", () => $("transferBiddersModal").classList.remove("open"));
   $("btnTop20ClearVote").addEventListener("click", () => {
     state.top20VotePlayerId = null;
     renderStatsTop20Prediction();
@@ -1907,6 +2297,7 @@ function renderStatsTables() {
   renderStatsMatchesTable();
   renderStatsAwardsTables();
   renderStatsTop20Prediction();
+  if (state.eventStatsData) renderEventStatsTable();
 }
 
 function renderStatsPlayersTable() {
@@ -2286,6 +2677,190 @@ function renderStatsTop20Prediction() {
 
   snubBody.querySelectorAll(".top20-snub-link").forEach((el) => {
     el.addEventListener("click", () => openPlayerStatsModal(Number(el.dataset.pid)));
+  });
+}
+
+function _awardBadgeHtml(label) {
+  if (!label) return "";
+  if (label === "MVP") return `<span class="pill pill-warn">MVP</span>`;
+  if (label === "EVP") return `<span class="pill pill-blue">EVP</span>`;
+  if (label === "HM") return `<span class="pill pill-ok">HM</span>`;
+  return `<span class="pill">${escapeHtml(label)}</span>`;
+}
+
+async function loadEventStats(tournamentId = null) {
+  if (!state.summary?.path) return;
+  try {
+    const url = tournamentId ? `/api/stats/event?tournament_id=${encodeURIComponent(tournamentId)}` : "/api/stats/event";
+    const data = await api(url);
+    state.eventStatsData = data;
+    if (data.event?.id) state.selectedEventId = data.event.id;
+    renderEventStats();
+  } catch (err) {
+    toast(`Failed loading event stats: ${err.message}`, "err");
+  }
+}
+
+function renderEventStats() {
+  const data = state.eventStatsData;
+  if (!data) return;
+  const sel = $("statsEventSelect");
+  const events = data.events || [];
+  const curId = data.event?.id || 0;
+
+  sel.innerHTML = events.length
+    ? events
+        .map((e) => {
+          const awTag = e.hasRecordedAwards ? ` [Saved: ${e.awardsCount}]` : "";
+          const champTag = e.championName && e.championName !== "—" ? ` | ${e.championName}` : "";
+          return `<option value="${e.id}" ${e.id === curId ? "selected" : ""}>${escapeHtml(e.date)} — ${escapeHtml(e.name)} (Rep ${e.reputation}, ${e.matchCount}m${champTag}${awTag})</option>`;
+        })
+        .join("")
+    : `<option value="">No played events found in save</option>`;
+
+  const ev = data.event;
+  const kpiGrid = $("statsEventKpiGrid");
+  if (!ev) {
+    kpiGrid.innerHTML = "";
+    $("statsEventTableTitle").textContent = "Event Player Leaderboard";
+    $("statsEventPlayerCount").textContent = "0 players";
+    $("statsEventPlayersBody").innerHTML = `<tr><td colspan="18" class="muted">No event stats available for this save yet.</td></tr>`;
+    return;
+  }
+
+  const slots = ev.awardSlots || {};
+  const gm = ev.gameMvp;
+  const fm = ev.fairMvp;
+  const rm = ev.recordedMvp;
+  const snub = ev.biggestSnub;
+  const over = ev.biggestOverreward;
+
+  const cards = [
+    ["Champion / Finalist", ev.championName || "—", `2nd: ${ev.runnerUpName || "—"} | ${ev.matchCount || 0} matches`],
+    ["Event Tier & Slots", ev.tierLabel || `Rep ${ev.reputation}`, `${slots.mvp || 0} MVP / ${slots.evp || 0} EVP / ${slots.hm || 0} HM`],
+    [
+      "Game Projected MVP",
+      gm ? `${gm.playerName} (${gm.score.toFixed(3)})` : "None (Rep < 13)",
+      gm ? `Rating ${gm.rating.toFixed(3)} (${gm.placement})${rm ? ` | Saved: ${rm.playerName}` : ""}` : rm ? `Saved: ${rm.playerName}` : "No MVP awarded",
+    ],
+    [
+      "Fair Score MVP",
+      fm ? `${fm.playerName} (${fm.score.toFixed(3)})` : "—",
+      fm ? `Rating ${fm.rating.toFixed(3)} (${fm.placement}) | k=${ev.kPrior || 1}` : "—",
+    ],
+    [
+      "Biggest Snub (Fair > Game)",
+      snub ? snub.playerName : "None",
+      snub
+        ? `Fair #${snub.fairRank} vs Game ${snub.gameRank ? "#" + snub.gameRank : "Ineligible"} (${snub.rating.toFixed(3)}, ${snub.placement})`
+        : "No major discrepancy",
+    ],
+    [
+      "Most Over-Rewarded (Game > Fair)",
+      over ? over.playerName : "None",
+      over ? `Game #${over.gameRank} vs Fair #${over.fairRank} (${over.rating.toFixed(3)}, ${over.placement})` : "No major discrepancy",
+    ],
+  ];
+
+  kpiGrid.innerHTML = cards
+    .map(
+      ([lbl, val, sub]) => `
+      <div class="kpi-card">
+        <div class="kpi-label">${escapeHtml(lbl)}</div>
+        <div class="kpi-val" style="font-size:16px;">${escapeHtml(val)}</div>
+        <div class="kpi-sub">${escapeHtml(sub)}</div>
+      </div>`
+    )
+    .join("");
+
+  $("statsEventTableTitle").textContent = `${ev.name} (${ev.date}) — ${ev.playerCount || 0} Players`;
+  renderEventStatsTable();
+}
+
+function renderEventStatsTable() {
+  const data = state.eventStatsData;
+  if (!data || !data.event) return;
+  const q = $("statsFilterQ").value.trim().toLowerCase();
+  const teamFilter = Number($("statsFilterTeam").value || 0);
+  const key = state.eventStatsSortKey || "fairRank";
+  const dir = state.eventStatsSortDir || 1;
+
+  const rows = (data.players || [])
+    .filter((p) => {
+      if (teamFilter && p.teamId !== teamFilter) return false;
+      if (q && !p.playerName.toLowerCase().includes(q) && !p.teamName.toLowerCase().includes(q)) return false;
+      return true;
+    })
+    .slice()
+    .sort((a, b) => {
+      const va = a[key];
+      const vb = b[key];
+      if (va === null || va === undefined) return 1;
+      if (vb === null || vb === undefined) return -1;
+      if (typeof va === "string") return dir * va.localeCompare(String(vb));
+      return dir * (va - vb);
+    });
+
+  $("statsEventPlayerCount").textContent = `${rows.length} players`;
+  const tbody = $("statsEventPlayersBody");
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td colspan="18" class="muted">No players match the current filter.</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = rows
+    .map((p) => {
+      const rCls = p.rating >= 1.15 ? "stat-good" : p.rating > 0 && p.rating < 0.95 ? "stat-bad" : "";
+      const kdCls = p.kd >= 1.1 ? "stat-good" : p.kd < 0.95 ? "stat-bad" : "";
+      const deltaStr =
+        p.rankDelta === null || p.rankDelta === undefined
+          ? `<span class="tag-pill warn">Inelig</span>`
+          : p.rankDelta > 0
+            ? `<span class="stat-good">+${p.rankDelta}</span>`
+            : p.rankDelta < 0
+              ? `<span class="stat-bad">${p.rankDelta}</span>`
+              : `<span class="muted">0</span>`;
+
+      const multStr = p.gameEligible ? `${p.gameMult.toFixed(2)}x` : `<span class="muted">0.00x</span>`;
+      const gameScoreStr = p.gameEligible
+        ? `<strong>${p.gameScore.toFixed(3)}</strong> ${_awardBadgeHtml(p.gameProjectedAward)}`
+        : `<span class="muted">Inelig (9th+)</span>`;
+
+      const breakdown = `Bayes: ${p.bayesRating.toFixed(3)} | Place: ${p.fairPlaceBonus >= 0 ? "+" : ""}${p.fairPlaceBonus.toFixed(3)} | Opp: ${p.fairOppBonus >= 0 ? "+" : ""}${p.fairOppBonus.toFixed(3)} | PO: +${p.fairPoBonus.toFixed(3)}`;
+      const fairScoreStr = `<strong title="${escapeHtml(breakdown)}">${p.fairScore.toFixed(3)}</strong> ${_awardBadgeHtml(p.fairProjectedAward)}`;
+      const odSign = p.openingDiff > 0 ? `+${p.openingDiff}` : String(p.openingDiff);
+      const ratTitle = p.ratingSource === "estimated" ? "Estimated fallback (no PCS row yet)" : "Exact rating from save playerCareerStats";
+
+      return `
+        <tr>
+          <td><strong>#${p.fairRank}</strong></td>
+          <td>${p.gameRank ? `#${p.gameRank}` : `<span class="muted">—</span>`}</td>
+          <td>${deltaStr}</td>
+          <td><span class="link-cell event-player-link" data-pid="${p.playerId}"><strong>${escapeHtml(p.playerName)}</strong></span></td>
+          <td><span class="link-cell event-team-link" data-tid="${p.teamId}">${escapeHtml(p.teamName)}</span></td>
+          <td>${escapeHtml(p.placement)}</td>
+          <td>${p.matches} <span class="muted">(${p.wins}-${p.losses})</span></td>
+          <td>${p.maps}${p.poMaps ? ` <span class="muted">(${p.poMaps})</span>` : ""}</td>
+          <td class="${rCls}" title="${escapeHtml(ratTitle)}"><strong>${p.rating.toFixed(3)}</strong>${p.ratingSource === "estimated" ? "*" : ""}</td>
+          <td class="${kdCls}">${p.kd.toFixed(2)}</td>
+          <td>${p.kpr.toFixed(2)}</td>
+          <td>${p.adr.toFixed(1)}</td>
+          <td class="${p.openingDiff > 0 ? "stat-good" : p.openingDiff < 0 ? "stat-bad" : ""}">${odSign}</td>
+          <td>${p.avgOppRank !== null ? `#${p.avgOppRank.toFixed(1)}` : "<span class='muted'>—</span>"}</td>
+          <td>${multStr}</td>
+          <td>${gameScoreStr}</td>
+          <td title="${escapeHtml(breakdown)}">${fairScoreStr}</td>
+          <td>${p.actualAward ? _awardBadgeHtml(p.actualAward) : "<span class='muted'>—</span>"}</td>
+        </tr>`;
+    })
+    .join("");
+
+  tbody.querySelectorAll(".event-player-link").forEach((el) => {
+    el.addEventListener("click", () => openPlayerStatsModal(Number(el.dataset.pid)));
+  });
+  tbody.querySelectorAll(".event-team-link").forEach((el) => {
+    const tid = Number(el.dataset.tid);
+    if (tid) el.addEventListener("click", () => openTeamStatsModal(tid));
   });
 }
 
@@ -3098,21 +3673,37 @@ function renderShowcaseTransfers() {
     if (!q) return true;
     return `${r.playerName} ${r.fromTeamName} ${r.toTeamName} ${r.compareName}`.toLowerCase().includes(q);
   });
+  state.showcaseTxShown = txs;
   $("scTransfersCount").textContent = `${txs.length} flagged`;
-  $("scTransfersBody").innerHTML = txs.length
+  const scBody = $("scTransfersBody");
+  scBody.innerHTML = txs.length
     ? txs
-        .map(
-          (r) => `<tr>
+        .map((r, idx) => {
+          const bCnt = r.bidderCount || 0;
+          const cdCnt = (r.cooldownBidCount || 0) + (r.activeBidCount || 0);
+          const pillCls = bCnt >= 8 ? "pill-bad" : bCnt >= 3 ? "pill-warn" : bCnt > 0 ? "pill-blue" : "";
+          const bidderCell = bCnt
+            ? `<span class="pill ${pillCls}">${bCnt} clubs${cdCnt ? ` (${cdCnt} bid)` : ""}</span>`
+            : `<span class="muted">0 logged</span>`;
+          return `<tr class="tx-bidders-row" data-txidx="${idx}" style="cursor:pointer;" title="Click to inspect all ${bCnt} bidding/interested clubs">
           <td class="mono muted">${escapeHtml(r.date)}</td>
-          <td><strong style="cursor:pointer;text-decoration:underline dotted;" onclick="openPlayerStatsModal(${r.playerId})">${escapeHtml(r.playerName)}</strong> <span class="mono muted">(${r.skill.toFixed(2)} sk, ${r.age}y)</span></td>
+          <td><strong style="cursor:pointer;text-decoration:underline dotted;" onclick="event.stopPropagation();openPlayerStatsModal(${r.playerId})">${escapeHtml(r.playerName)}</strong> <span class="mono muted">(${r.skill.toFixed(2)} sk, ${r.age}y)</span></td>
           <td>${escapeHtml(r.fromTeamName)} &rarr; <strong>${escapeHtml(r.toTeamName)}</strong></td>
           <td class="mono">${r.purchasePrice > 0 ? `$${r.purchasePrice.toLocaleString()}` : "Free"}</td>
           <td>${r.compareName !== "—" ? `${escapeHtml(r.compareName)} <span class="stat-good mono">(${r.compareSkill.toFixed(2)})</span>` : "—"}</td>
+          <td>${bidderCell}</td>
           <td>${(r.reasons || []).map((rs) => `<div style="font-size:12px;">${escapeHtml(rs)}</div>`).join("")}</td>
-        </tr>`
-        )
+        </tr>`;
+        })
         .join("")
-    : `<tr><td colspan="6" class="muted" style="text-align:center;padding:18px;">No unexplainable transfers matching filter.</td></tr>`;
+    : `<tr><td colspan="7" class="muted" style="text-align:center;padding:18px;">No unexplainable transfers matching filter.</td></tr>`;
+
+  scBody.querySelectorAll("tr.tx-bidders-row").forEach((tr) => {
+    tr.addEventListener("click", () => {
+      const tx = state.showcaseTxShown?.[Number(tr.dataset.txidx)];
+      if (tx) openTransferBiddersModal(tx);
+    });
+  });
 
   // "Only National" & "Only National Language" Policy Violations
   const pMode = $("scPolicyFilterMode").value || "players";
@@ -3147,6 +3738,89 @@ function renderShowcaseTransfers() {
         })
         .join("")
     : `<tr><td colspan="8" class="muted" style="text-align:center;padding:18px;">No policy violations matching filter.</td></tr>`;
+}
+
+function openTransferBiddersModal(tx) {
+  const bidders = tx.bidders || [];
+  $("tbModalTitle").textContent = `${tx.playerName} — Vulture Suitors & Bidder Swarm`;
+  $("tbModalSubtitle").textContent = `${tx.fromTeamName} → ${tx.toTeamName} on ${tx.date} (${tx.purchasePrice > 0 ? `$${tx.purchasePrice.toLocaleString()}` : "Free"} · ${tx.skill.toFixed(2)} avg skill · ${tx.age}y${tx.playerNation ? ` · ${tx.playerNation}` : ""})`;
+
+  const peakScore = bidders.length ? Math.max(...bidders.map((b) => b.peakScore || 0)) : 0;
+  const kpis = [
+    ["Total Clubs Hunting", String(tx.bidderCount || 0), `${tx.bidderEntries || 0} total role evaluations`],
+    ["Failed / Cooldown Bids", String(tx.cooldownBidCount || 0), "Lost bid -> 93d personCooldown"],
+    ["Active / Pending Bids", String(tx.activeBidCount || 0), "Currently bidding or offering"],
+    ["Policy-Breaking Suitors", String(tx.policyMismatchBidders || 0), "'Only National / Lang' violations"],
+    ["Peak AI Eval Score", peakScore.toFixed(2), tx.toTeamName ? `Winner: ${tx.toTeamName}` : "—"],
+  ];
+
+  const kpiHtml = `<div class="kpi-grid" style="margin-bottom:14px;">${kpis
+    .map(
+      ([lbl, val, sub]) => `<div class="kpi-card">
+      <div class="kpi-label">${escapeHtml(lbl)}</div>
+      <div class="kpi-val" style="font-size:18px;">${escapeHtml(val)}</div>
+      <div class="kpi-sub">${escapeHtml(sub)}</div>
+    </div>`
+    )
+    .join("")}</div>`;
+
+  const reasonsHtml = (tx.reasons || []).length
+    ? `<div class="info-banner" style="font-size:12px;margin-bottom:14px;">
+        <strong>Why Flagged:</strong> ${(tx.reasons || []).map((rs) => escapeHtml(rs)).join(" &bull; ")}
+      </div>`
+    : "";
+
+  const rowsHtml = bidders.length
+    ? `<div class="table-wrap" style="max-height:54vh;">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Club</th>
+              <th>Rank &amp; Nation</th>
+              <th>Club Policy</th>
+              <th>Bid / Interest Status</th>
+              <th>Roles</th>
+              <th>Urgency</th>
+              <th>AI Score</th>
+              <th>Cooldown</th>
+              <th>Offer / Limits</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${bidders
+              .map((b, idx) => {
+                const stCls = b.isActiveBid ? "pill-warn" : b.isCooldownBid ? "pill-bad" : "pill-blue";
+                const polHtml = b.violatesPolicy
+                  ? `<span class="tag-pill">${escapeHtml(b.policyDetail || b.hiringBiasLabel)}</span>`
+                  : `<span class="muted">${escapeHtml(b.hiringBiasLabel)}</span>`;
+                const offers = [];
+                if (b.maxAbsoluteOffer > 0) offers.push(`MaxBid $${b.maxAbsoluteOffer.toLocaleString()}`);
+                if (b.buyoutPrice > 0) offers.push(`Buyout $${b.buyoutPrice.toLocaleString()}`);
+                if (b.offerSalary > 0) offers.push(`Sal $${b.offerSalary.toLocaleString()}/yr`);
+                if (b.offerAskingPrice > 0) offers.push(`Ask $${b.offerAskingPrice.toLocaleString()}`);
+                const isWinner = b.teamId === tx.toTeamId;
+                return `<tr${isWinner ? ' style="background:rgba(34,197,94,0.08);"' : ""}>
+                  <td class="muted">${idx + 1}</td>
+                  <td><strong style="cursor:pointer;text-decoration:underline dotted;" onclick="openTeamStatsModal(${b.teamId})">${escapeHtml(b.teamName)}</strong>${isWinner ? ` <span class="pill pill-ok">Winner</span>` : ""}${b.entriesCount > 1 ? ` <span class="muted" style="font-size:11px;">(${b.entriesCount}x)</span>` : ""}</td>
+                  <td class="mono">${b.worldRank ? `#${b.worldRank}` : "—"} <span class="muted">· ${escapeHtml(b.teamNation)}</span></td>
+                  <td style="font-size:12px;">${polHtml}</td>
+                  <td><span class="pill ${stCls}">${escapeHtml(b.bestStatusLabel)}</span></td>
+                  <td>${escapeHtml(b.rolesText || "Any")}</td>
+                  <td>${escapeHtml(b.urgencyLabel)}</td>
+                  <td class="mono"><strong>${Number(b.peakScore || 0).toFixed(2)}</strong></td>
+                  <td class="mono">${b.maxCooldown > 0 ? `${b.maxCooldown}d` : "—"}</td>
+                  <td class="mono" style="font-size:12px;">${offers.length ? offers.join(" · ") : "<span class='muted'>—</span>"}</td>
+                </tr>`;
+              })
+              .join("")}
+          </tbody>
+        </table>
+      </div>`
+    : `<div class="info-banner" style="font-size:13px;">No bidder/cooldown entries remain in <code>teams[].personInterests</code> or <code>emails</code> for <strong>${escapeHtml(tx.playerName)}</strong>. Note: CS Manager automatically clears <code>personCooldown</code> (failed bidder records) once their ~93-day timer expires, so older transfers from earlier months no longer retain rejected suitors in the save file. Try clicking recent or multi-team vulture rows marked with bidder counts!</div>`;
+
+  $("tbModalBody").innerHTML = `${kpiHtml}${reasonsHtml}${rowsHtml}`;
+  $("transferBiddersModal").classList.add("open");
 }
 
 function renderShowcaseStability() {
@@ -4167,6 +4841,20 @@ function renderHelperWonderkids(d) {
 }
 
 // ==================== GOD MODE LAB ====================
+function renderGodNerfTeamSelect() {
+  const teams = state._godTeamsAll || [];
+  const q = ($("godNerfTeamSearch")?.value || "").trim().toLowerCase();
+  const filtered = q
+    ? teams.filter((t) => `${t.worldRank ? `#${t.worldRank} ` : ""}${t.name}`.toLowerCase().includes(q))
+    : teams;
+  const curNerfTid = $("godNerfTeam").value || (filtered.find((t) => t.isUserTeam)?.teamId ?? filtered[0]?.teamId ?? "");
+  populateSelect(
+    $("godNerfTeam"),
+    filtered.map((t) => [t.teamId, `${t.worldRank ? `#${t.worldRank} ` : ""}${t.name}${t.isUserTeam ? " (YOU)" : ""} — ${t.avgSkill} avg`]),
+    curNerfTid
+  );
+}
+
 async function loadGodMode() {
   if (!state.summary?.path && !state.summary?.filename) return;
   try {
@@ -4174,17 +4862,8 @@ async function loadGodMode() {
     state.godModeData = d;
     if (!d.loaded) return;
 
-    const teams = d.teams || [];
-    const curNerfTid = $("godNerfTeam").value || (teams.find((t) => t.isUserTeam)?.teamId ?? teams[0]?.teamId ?? "");
-    populateSelect(
-      $("godNerfTeam"),
-      teams.map((t) => [t.teamId, `${t.worldRank ? `#${t.worldRank} ` : ""}${t.name}${t.isUserTeam ? " (YOU)" : ""} — ${t.avgSkill} avg`]),
-      curNerfTid
-    );
-    if (d.defaultProtectedStar) {
-      $("godProtectedNames").placeholder = `e.g. ${d.defaultProtectedStar}`;
-      $("godNerfProtected").placeholder = `e.g. ${d.defaultProtectedStar}`;
-    }
+    state._godTeamsAll = d.teams || [];
+    renderGodNerfTeamSelect();
 
     const s = d.snapshot || {};
     const kpis = [
@@ -4314,6 +4993,7 @@ async function runGodModeAction(action, dryRun) {
 
 async function init() {
   bindEvents();
+  if (window.studioInit) window.studioInit();
   try {
     state.meta = await api("/api/meta");
     state.summary = await api("/api/summary");

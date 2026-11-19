@@ -18,8 +18,11 @@
         <button id="btnLoadSelected" class="btn">Load</button>
         <button id="btnBrowsePath" class="btn" title="Open a .json save (native file picker on desktop, browser file upload on mobile/remote or fallback)">Browse / Upload .json...</button>
         <input id="uploadSaveInput" type="file" accept=".json,application/json" hidden />
+        <button id="btnCommandPalette" class="btn" title="Global Search (Ctrl+K)">Search <span class="cmd-kbd">Ctrl+K</span></button>
+        <button id="btnOpenSnapshots" class="btn" title="Undo Time Machine Snapshots">Snapshots (<span id="snapCountBadge">0</span>)</button>
         <button id="btnOpenFolder" class="btn" title="Open save folder on host desktop">Open Folder</button>
         <button id="btnValidate" class="btn btn-blue">Validate &amp; Fix</button>
+        <button id="btnDiskBackup" class="btn" title="Write a timestamped backup snapshot into backups/ without overwriting the active save">Backup Copy</button>
         <button id="btnSave" class="btn btn-primary">Save (with Backup)</button>
         <button id="btnSaveAs" class="btn btn-success" title="Save As via file dialog or download on remote device">Save As...</button>
         <button id="btnDownloadSave" class="btn btn-success" title="Download edited save .json to your browser/device">Download .json</button>
@@ -36,10 +39,11 @@
     <button class="tab-btn" data-tab="staff">Staff</button>
     <button class="tab-btn" data-tab="teams">Orgs / Teams</button>
     <button class="tab-btn" data-tab="stats">Stats</button>
+    <button class="tab-btn" data-tab="tournaments">Tournaments &amp; Awards</button>
     <button class="tab-btn" data-tab="showcase">Bug Showcase</button>
     <button class="tab-btn" data-tab="realism">Data Science</button>
     <button class="tab-btn" data-tab="helper">Manager Helper</button>
-    <button class="tab-btn" data-tab="godmode">God Mode</button>
+    <button class="tab-btn" data-tab="studiolabs">Studio Labs</button>
   </nav>
 
   <main class="container">
@@ -233,6 +237,7 @@
             <h2 class="card-title">Players</h2>
             <div class="inline-actions">
               <span id="playersCountLabel" class="muted">0</span>
+              <button id="btnOpenRelationsModal" class="btn btn-sm btn-blue">Relations Manager</button>
               <button id="btnOpenNewPlayer" class="btn btn-sm btn-primary">+ New Player</button>
             </div>
           </div>
@@ -403,6 +408,7 @@
         <button class="subtab-btn" data-subtab="maps">Map Pool Meta</button>
         <button class="subtab-btn" data-subtab="matches">Match History</button>
         <button class="subtab-btn" data-subtab="awards">Trophies &amp; Awards</button>
+        <button class="subtab-btn" data-subtab="events">Event Stats &amp; MVP Compare</button>
         <button class="subtab-btn" data-subtab="top20">Top 20 Prediction</button>
       </div>
 
@@ -553,10 +559,13 @@
             </div>
             <div class="top20-actions">
               <span id="top20StatusPill" class="pill pill-blue">Base Projection</span>
-              <button id="btnTop20ApplySaveVote" class="btn btn-sm btn-blue" style="display:none;">Apply Save's Vote</button>
+              <button id="btnTop20ApplySaveVote" class="btn btn-sm btn-blue" style="display:none;">Apply Save&apos;s Vote</button>
               <button id="btnTop20ClearVote" class="btn btn-sm btn-ghost" style="display:none;">Clear Vote</button>
+              <button id="btnTop20RecalcSave" class="btn btn-sm btn-primary" title="Rewrite this year&apos;s Top 20 awards &amp; CSTV email using current MVPs/EVPs">Recalculate &amp; Save Top 20</button>
+              <button id="btnTop20ResetClear" class="btn btn-sm btn-danger" title="Wipe/reset all Top 20 awards &amp; CSTV result email for this year">Reset / Clear Top 20</button>
             </div>
           </div>
+          <div id="top20PatchResult" style="margin-bottom:8px;font-size:12px;"></div>
           <div class="table-wrap" style="max-height:70vh;">
             <table>
               <thead>
@@ -604,6 +613,61 @@
                 </tr>
               </thead>
               <tbody id="statsTop20SnubbedBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div id="subtab-events" class="subtab-panel">
+        <div class="card" style="margin-bottom:14px;">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">Tournament Event Stats — Fair Score vs Real Game MVP/EVP</h3>
+              <div class="muted" style="font-size:12px;margin-top:3px;">Inspect every player&apos;s tournament stats and compare the engine&apos;s actual MVP/EVP formula against an HLTV-style Fair Score.</div>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;">
+              <select id="statsEventSelect" style="min-width:290px;max-width:440px;"></select>
+              <button id="btnEventStatsRefresh" class="btn btn-sm btn-blue">Reload Event</button>
+            </div>
+          </div>
+          <div class="info-banner" style="font-size:12px;margin-top:4px;">
+            <strong>Real Game Score:</strong> <code>Rating &times; Mult</code>, restricted to <strong>Top 8 teams only</strong> (9th+ ineligible). Multipliers from <code>Tournament.CalculateAndGetAwardsList</code>: <strong>1st = 1.20&times;</strong>, <strong>2nd = 1.10&times;</strong>, Final Stage 3rd&ndash;8th = <strong>1.00&times;</strong>, Non-Final Top 8 = <strong>0.90&times;</strong>.<br>
+            <strong>Our Fair Score:</strong> <code>BayesRating(k=25% MaxM) + PlaceBonus (+0.055 / +0.030 / +0.010 / -0.015 / -0.055) + OppRank(&plusmn;0.040) + PlayoffVol(+0.045 &times; PO/MaxPO)</code>, with <strong>MVP locked to Grand Finalists (1st or 2nd)</strong> like HLTV. Hover any Fair Score for breakdown.
+          </div>
+        </div>
+
+        <div class="kpi-grid" id="statsEventKpiGrid" style="margin-bottom:14px;"></div>
+
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title" id="statsEventTableTitle">Event Player Leaderboard</h3>
+            <span id="statsEventPlayerCount" class="muted">0</span>
+          </div>
+          <div class="table-wrap" style="max-height:70vh;">
+            <table>
+              <thead>
+                <tr>
+                  <th class="sortable sort-active" data-esort="fairRank">Fair #</th>
+                  <th class="sortable" data-esort="gameRank">Game #</th>
+                  <th class="sortable" data-esort="rankDelta">Shift</th>
+                  <th class="sortable" data-esort="playerName">Player</th>
+                  <th class="sortable" data-esort="teamName">Team</th>
+                  <th class="sortable" data-esort="placement">Place</th>
+                  <th class="sortable" data-esort="matches">M (W-L)</th>
+                  <th class="sortable" data-esort="maps">Maps (PO)</th>
+                  <th class="sortable" data-esort="rating">Rating</th>
+                  <th class="sortable" data-esort="kd">K/D</th>
+                  <th class="sortable" data-esort="kpr">KPR</th>
+                  <th class="sortable" data-esort="adr">ADR</th>
+                  <th class="sortable" data-esort="openingDiff">OK-OD</th>
+                  <th class="sortable" data-esort="avgOppRank">Opp #</th>
+                  <th class="sortable" data-esort="gameMult">Game Mult</th>
+                  <th class="sortable" data-esort="gameScore">Game Score</th>
+                  <th class="sortable" data-esort="fairScore">Fair Score</th>
+                  <th>Saved Award</th>
+                </tr>
+              </thead>
+              <tbody id="statsEventPlayersBody"></tbody>
             </table>
           </div>
         </div>
@@ -787,7 +851,7 @@
 
         <div class="card">
           <div class="card-header">
-            <h3 class="card-title">Unexplainable AI Transfer History</h3>
+            <h3 class="card-title">Unexplainable AI Transfer History <span class="muted" style="font-weight:400;font-size:12px;">(Click any transfer row to inspect every bidder / vulture club)</span></h3>
             <span id="scTransfersCount" class="muted">0</span>
           </div>
           <div class="table-wrap" style="max-height:62vh;">
@@ -799,6 +863,7 @@
                   <th>Route</th>
                   <th>Fee</th>
                   <th>Better Option Ignored / Benched</th>
+                  <th>Bidders / Vultures</th>
                   <th>Why Unexplainable</th>
                 </tr>
               </thead>
@@ -1354,8 +1419,287 @@
       </div>
     </section>
 
-    <!-- ==================== GOD MODE TAB ==================== -->
-    <section id="tab-godmode" class="tab-panel">
+    <!-- ==================== TOURNAMENTS & FAIR-AWARD PATCHER TAB ==================== -->
+    <section id="tab-tournaments" class="tab-panel">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <h2 class="card-title">Tournaments Hub &amp; Retroactive Fair-Award Patcher</h2>
+            <div class="muted" style="font-size:12px;">Rewrite broken game-awarded MVPs/EVPs with Save Editor's Bayesian Fair-Score rankings while preserving Event Wins &amp; Top 20 career history.</div>
+          </div>
+          <div class="inline-actions">
+            <label style="font-size:12px;color:var(--text-muted);">Min Rep:</label>
+            <input id="tmBatchMinRep" type="number" min="1" max="20" value="13" style="width:68px;" />
+            <button id="btnTmBatchDry" class="btn btn-sm btn-blue">Dry-Run Tier-1 Batch</button>
+            <button id="btnTmBatchApply" class="btn btn-sm btn-primary">Patch All Tier-1 Fair Awards</button>
+            <button id="btnTmSyncAwards" class="btn btn-sm" title="Rebuild all players&apos; MVP/EVP career awards strictly from each tournament&apos;s saved winners and exact end month (fixes duplicate Spring/Fall awards)">Repair / Sync Player Awards</button>
+            <label style="font-size:12px;color:var(--text-muted);margin-left:6px;">Top 20 Year:</label>
+            <select id="tmTop20Year" style="width:82px;"></select>
+            <button id="btnTmRecalcTop20" class="btn btn-sm btn-success" title="Recalculate &amp; save this year&apos;s Top 20 awards &amp; CSTV email">Recalc Top 20</button>
+            <button id="btnTmResetTop20" class="btn btn-sm btn-danger" title="Clear/reset this year&apos;s Top 20 awards &amp; CSTV email">Reset Top 20</button>
+          </div>
+        </div>
+        <div id="tmBatchResult" class="verdict-banner">Select an event below to inspect stages, edit prize/prestige metadata, or preview/apply Fair MVP &amp; EVP awards.</div>
+      </div>
+
+      <div class="split-layout">
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title">Events (<span id="tmListCount">0</span>)</h3>
+            <div class="inline-actions">
+              <label class="checkbox-row" style="font-size:12px;">
+                <input id="tmHideUpcoming" type="checkbox" checked />
+                <span>Hide Upcoming</span>
+              </label>
+              <label class="checkbox-row" style="font-size:12px;">
+                <input id="tmMismatchOnly" type="checkbox" />
+                <span>MVP Mismatch Only</span>
+              </label>
+            </div>
+          </div>
+          <div class="filter-row" style="margin-bottom:8px;">
+            <input id="tmSearchInput" type="text" placeholder="Search event or champion..." />
+            <select id="tmSortBy">
+              <option value="awards_first">Sort: MVP / EVP Giving First</option>
+              <option value="date_desc">Sort: Date (Newest)</option>
+              <option value="mismatch_first">Sort: MVP Mismatch First</option>
+              <option value="rep_desc">Sort: Reputation (High &rarr; Low)</option>
+            </select>
+          </div>
+          <div class="table-wrap" style="max-height:66vh;">
+            <table>
+              <thead>
+                <tr><th>Event</th><th>Rep</th><th>Winner</th><th>Game MVP</th><th>Fair MVP</th></tr>
+              </thead>
+              <tbody id="tmTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title" id="tmDetailTitle">Select an Event</h3>
+              <div class="muted" id="tmDetailSubtitle" style="font-size:12px;">No tournament selected.</div>
+            </div>
+            <button id="btnTmRefreshDetail" class="btn btn-sm" disabled>Refresh</button>
+          </div>
+
+          <div class="subcard">
+            <div class="subcard-title">Tournament Metadata</div>
+            <div class="form-grid">
+              <div class="field"><label>Reputation (1-20)</label><input id="tmEditRep" type="number" min="1" max="20" value="15" /></div>
+              <div class="field"><label>Sticker Low ($)</label><input id="tmEditStickLow" type="number" min="0" step="5000" value="0" /></div>
+              <div class="field"><label>Sticker High ($)</label><input id="tmEditStickHigh" type="number" min="0" step="5000" value="0" /></div>
+              <div class="field">
+                <label>Grand Final Format</label>
+                <label class="checkbox-row" style="margin-top:6px;"><input id="tmEditBo5" type="checkbox" /><span>Bo5 Grand Final</span></label>
+              </div>
+            </div>
+            <div class="inline-actions" style="margin-top:8px;">
+              <button id="btnTmSaveMeta" class="btn btn-sm btn-primary" disabled>Save Tournament Meta</button>
+            </div>
+          </div>
+
+          <div class="subcard">
+            <div class="subcard-title">Retroactive MVP / EVP / HM Patcher</div>
+            <div class="verdict-banner" style="font-size:12px;margin-bottom:8px;">
+              <strong>Real Game Score:</strong> <code>Rating &times; Mult</code>, restricted to <strong>Top 8 teams only</strong> (9th+ ineligible; <strong>1st = 1.20&times;</strong>, <strong>2nd = 1.10&times;</strong>, Final Stage 3rd&ndash;8th = <strong>1.00&times;</strong>, Non-Final Top 8 = <strong>0.90&times;</strong>).<br>
+              <strong>Our Fair Score:</strong> <code>BayesRating(k=25% MaxM) + PlaceBonus (+0.055 / +0.030 / +0.010 / -0.015 / -0.055) + OppRank(&plusmn;0.040) + PlayoffVol(+0.045 &times; PO/MaxPO)</code>, with <strong>MVP locked to Grand Finalists (1st or 2nd)</strong> like HLTV. Hover any Fair Score for breakdown.
+            </div>
+            <div id="tmPatchSlotInfo" class="muted" style="font-size:12px;margin-bottom:8px;">Select a tournament to view award slot allocation.</div>
+            <div class="inline-actions" style="margin-bottom:8px;">
+              <button id="btnTmPatchFairDry" class="btn btn-sm btn-blue" disabled>Preview Fair Patch</button>
+              <button id="btnTmPatchFairApply" class="btn btn-sm btn-primary" disabled>Apply Fair MVP/EVP Awards</button>
+              <button id="btnTmPatchCustom" class="btn btn-sm btn-success" disabled>Apply Checked Custom Order</button>
+            </div>
+            <div id="tmPatchPreview" class="muted" style="font-size:12px;"></div>
+          </div>
+
+          <div class="subcard">
+            <div class="subcard-title">Stages</div>
+            <div id="tmStagesList" class="muted" style="font-size:12px;">-</div>
+          </div>
+
+          <div class="subcard">
+            <div class="subcard-title">Event Leaderboard (Check rows for Custom Award Order)</div>
+            <div class="table-wrap" style="max-height:42vh;">
+              <table>
+                <thead>
+                  <tr><th>Pick</th><th>Fair #</th><th>Game #</th><th>Shift</th><th>Player</th><th>Team</th><th>Place</th><th>M (W-L)</th><th>Maps (PO)</th><th>Rating</th><th>Opp #</th><th>Game Score</th><th>Fair Score</th><th>Saved Award</th></tr>
+                </thead>
+                <tbody id="tmPlayersTableBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== STUDIO LABS TAB ==================== -->
+    <section id="tab-studiolabs" class="tab-panel">
+      <div class="subtabs">
+        <button class="subtab-btn active" data-stsubtab="stCareerHq">Career HQ</button>
+        <button class="subtab-btn" data-stsubtab="stDiff">Save Diff</button>
+        <button class="subtab-btn" data-stsubtab="stGodMode">God Mode</button>
+        <button class="subtab-btn" data-stsubtab="stSandbox">Roster Sandbox &amp; Sim</button>
+        <button class="subtab-btn" data-stsubtab="stGrowth">Growth &amp; Trajectory</button>
+        <button class="subtab-btn" data-stsubtab="stMarket">Market Radar</button>
+        <button class="subtab-btn" data-stsubtab="stWeapons">Weapon Meta Lab</button>
+      </div>
+
+      <!-- Subtab 1: Career & Club HQ -->
+      <div id="stSub-stCareerHq" class="stsubtab-panel active">
+        <div class="kpi-grid" id="chKpiGrid"></div>
+
+        <div class="two-col">
+          <div class="card">
+            <div class="card-header">
+              <h3 class="card-title">Manager Identity &amp; Contract</h3>
+              <button id="btnChSaveIdentity" class="btn btn-sm btn-primary">Save Identity &amp; Contract</button>
+            </div>
+            <div class="form-grid">
+              <div class="field"><label>Manager Name</label><input id="chManagerName" type="text" /></div>
+              <div class="field"><label>Age</label><input id="chManagerAge" type="number" min="18" max="90" /></div>
+              <div class="field"><label>Nation</label><select id="chManagerNation"></select></div>
+              <div class="field"><label>Annual Salary ($)</label><input id="chManagerSalary" type="number" min="0" step="5000" /></div>
+              <div class="field"><label>Contract Expiry</label><input id="chManagerEndDate" type="date" /></div>
+            </div>
+            <div class="subcard" style="margin-top:10px;">
+              <div class="subcard-title">Head Coach / Manager Skills (1-20)</div>
+              <div class="skill-grid" id="chManagerSkillsGrid"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3 class="card-title">Board Job Security &amp; Goals</h3>
+              <div class="inline-actions">
+                <button id="btnChMaxSecurity" class="btn btn-sm btn-success">100% All Sliders</button>
+                <button id="btnChSaveSecurity" class="btn btn-sm btn-primary">Save Security</button>
+              </div>
+            </div>
+            <div class="form-grid" style="margin-bottom:10px;">
+              <div class="field"><label>Ranking Goal</label><input id="chRankGoal" type="number" min="1" max="5000" /></div>
+              <div class="field"><label>Grace Period (Months)</label><input id="chGracePeriod" type="number" min="0" max="60" /></div>
+            </div>
+            <div class="pers-grid" id="chSecSliders"></div>
+          </div>
+        </div>
+
+        <div class="two-col">
+          <div class="card">
+            <div class="card-header">
+              <h3 class="card-title">Club Takeover &amp; Quick Wellness</h3>
+              <div class="inline-actions">
+                <button id="btnChHealSquad" class="btn btn-sm btn-success">Heal Squad Burnout &amp; Mood</button>
+                <button id="btnChOpenTeamEditor" class="btn btn-sm btn-blue">Open Org Editor</button>
+              </div>
+            </div>
+            <div class="form-grid">
+              <div class="field"><label>Filter Clubs</label><input id="chSwitchTeamSearch" type="text" placeholder="Search club..." /></div>
+              <div class="field"><label>Target Club</label><select id="chSwitchTeamSelect"></select></div>
+            </div>
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:8px;flex-wrap:wrap;">
+              <label class="checkbox-row"><input id="chSwapCoach" type="checkbox" /><span>Also swap club contract cleanly</span></label>
+              <button id="btnChSwitchTeam" class="btn btn-sm btn-danger">Take Over Club</button>
+            </div>
+            <div class="subcard" style="margin-top:10px;">
+              <div class="subcard-title">Club Ranking Trend &amp; Recent Trophies</div>
+              <div id="chRankSparkline" class="chart-box" style="margin-bottom:8px;"></div>
+              <div id="chRecentTrophies" class="muted" style="font-size:12px;">-</div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3 class="card-title">Managed Squad Pulse</h3>
+              <span class="muted" style="font-size:12px;">Click player to edit</span>
+            </div>
+            <div class="table-wrap" style="max-height:240px;margin-bottom:10px;">
+              <table>
+                <thead><tr><th>Player</th><th>Role</th><th>Avg</th><th>Mood</th><th>Burnout</th><th>Salary/yr</th></tr></thead>
+                <tbody id="chRosterTableBody"></tbody>
+              </table>
+            </div>
+            <div class="subcard-title">Recent Club Transfers</div>
+            <div class="table-wrap" style="max-height:170px;">
+              <table>
+                <thead><tr><th>Date</th><th>Person</th><th>From</th><th>To</th><th>Fee</th></tr></thead>
+                <tbody id="chTransfersTableBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Subtab 2: Save Diff & Compare -->
+      <div id="stSub-stDiff" class="stsubtab-panel">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">Save Diff &amp; Timeline Compare</h3>
+              <div class="muted" style="font-size:12px;">Compare any earlier save or backup against your currently loaded save state.</div>
+            </div>
+            <div class="inline-actions">
+              <select id="diffBaselineSelect" class="save-select"></select>
+              <button id="btnRunSaveDiff" class="btn btn-sm btn-primary">Compare Saves</button>
+            </div>
+          </div>
+          <div id="diffMetaBanner" class="verdict-banner">Select a baseline save or backup and click <strong>Compare Saves</strong>.</div>
+          <div class="kpi-grid" id="diffKpiGrid" style="margin-top:10px;"></div>
+        </div>
+
+        <div class="two-col">
+          <div class="card">
+            <div class="card-header"><h3 class="card-title">Top Skill Risers</h3></div>
+            <div class="table-wrap" style="max-height:280px;">
+              <table>
+                <thead><tr><th>Player</th><th>Team</th><th>Before</th><th>After</th><th>Delta</th></tr></thead>
+                <tbody id="diffSkillRisersBody"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-header"><h3 class="card-title">Top Skill Fallers</h3></div>
+            <div class="table-wrap" style="max-height:280px;">
+              <table>
+                <thead><tr><th>Player</th><th>Team</th><th>Before</th><th>After</th><th>Delta</th></tr></thead>
+                <tbody id="diffSkillFallersBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="two-col">
+          <div class="card">
+            <div class="card-header"><h3 class="card-title">Biggest World Rank Climbers &amp; Fallers</h3></div>
+            <div class="table-wrap" style="max-height:260px;">
+              <table>
+                <thead><tr><th>Team</th><th>Before #</th><th>After #</th><th>Shift</th></tr></thead>
+                <tbody id="diffRankClimbersBody"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-header"><h3 class="card-title">New Transfers Since Baseline</h3></div>
+            <div class="table-wrap" style="max-height:260px;">
+              <table>
+                <thead><tr><th>Date</th><th>Person</th><th>From</th><th>To</th><th>Fee</th></tr></thead>
+                <tbody id="diffTransfersBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header"><h3 class="card-title">New Trophies &amp; Awards Earned Since Baseline</h3></div>
+          <div id="diffAwardsBody" class="muted" style="font-size:12px;">-</div>
+        </div>
+      </div>
+
+      <!-- Subtab 3: God Mode -->
+      <div id="stSub-stGodMode" class="stsubtab-panel">
       <div class="card">
         <div class="card-header">
           <div>
@@ -1398,7 +1742,7 @@
             <div class="field"><label>Floor / Compress Target (1-20)</label><input id="godBoostFloor" type="number" step="0.2" min="10" max="19.5" value="15.8" /></div>
             <div class="field"><label>Smooth Blend % (10-100)</label><input id="godBoostStrength" type="number" step="5" min="10" max="100" value="75" /></div>
             <div class="field"><label>Weakest-Slot Delta (+Skill)</label><input id="godBoostDelta" type="number" step="0.2" min="0.2" max="5" value="1.2" /></div>
-            <div class="field"><label>Protected Star Names (comma-sep)</label><input id="godProtectedNames" type="text" placeholder="e.g. TopStar1, TopStar2" /></div>
+            <div class="field"><label>Protected Star Names (comma-sep)</label><input id="godProtectedNames" type="text" value="" placeholder="Optional comma-separated names" /></div>
           </div>
           <label style="display:flex;align-items:center;gap:8px;margin:8px 0 12px;font-size:12.5px;">
             <input id="godProtectUser" type="checkbox" checked style="width:auto;" /> Keep User Team untouched (only buff AI rivals)
@@ -1413,15 +1757,16 @@
         <div class="card">
           <div class="card-header">
             <div>
-              <h3 class="card-title">2. Smooth Superteam (Keep Star OP!)</h3>
-              <div class="muted" style="font-size:12px;">Lower a dominant team's average to realistic Tier-1 parity while keeping chosen star player(s) completely untouched.</div>
+              <h3 class="card-title">2. Smooth Superteam (Any Team)</h3>
+              <div class="muted" style="font-size:12px;">Lower any chosen team's average to realistic Tier-1 parity while keeping your optional protected star player(s) completely untouched.</div>
             </div>
           </div>
           <div class="form-grid">
+            <div class="field"><label>Filter Target Team</label><input id="godNerfTeamSearch" type="text" placeholder="Filter by team name or #rank..." /></div>
             <div class="field"><label>Target Team</label><select id="godNerfTeam"></select></div>
             <div class="field"><label>Target 5-Man Team Avg (12-19)</label><input id="godNerfTargetAvg" type="number" step="0.1" min="12" max="19" value="16.2" /></div>
             <div class="field"><label>Max Non-Protected Starter Cap</label><input id="godNerfCapNon" type="number" step="0.2" min="12" max="20" value="17.0" /></div>
-            <div class="field"><label>Protected Stars (Untouched)</label><input id="godNerfProtected" type="text" placeholder="e.g. TopStar1" /></div>
+            <div class="field"><label>Protected Stars (Untouched)</label><input id="godNerfProtected" type="text" value="" placeholder="Optional comma-separated names" /></div>
           </div>
           <div class="inline-actions" style="margin-top:12px;">
             <button id="btnGodNerfPreview" class="btn btn-sm">Preview Superteam Smooth</button>
@@ -1512,6 +1857,242 @@
             </thead>
             <tbody id="godResultTableBody"></tbody>
           </table>
+        </div>
+      </div>
+      </div>
+
+      <!-- Subtab 4: Roster Sandbox -->
+      <div id="stSub-stSandbox" class="stsubtab-panel">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">Roster Sandbox &amp; Head-to-Head Simulator</h3>
+              <div class="muted" style="font-size:12px;">Test any 5-man fantasy lineup against a rival (skill^2.8 Bo1/Bo3/Bo5 win odds, comms languages, friend/rival chemistry, role conflicts, 7-map comfort) before committing transfers + tactics.</div>
+            </div>
+            <div class="inline-actions">
+              <button id="btnSbLoadTeam" class="btn btn-sm">Load Current 5</button>
+              <button id="btnSbRunSim" class="btn btn-sm btn-blue">Simulate Lineup</button>
+              <button id="btnSbCommitRoster" class="btn btn-sm btn-danger">Commit Transfer + Tactics</button>
+            </div>
+          </div>
+          <div class="form-grid">
+            <div class="field"><label>Target Team</label><select id="sbTeamSelect"></select></div>
+            <div class="field"><label>Test Against Opponent</label><select id="sbVsTeamSelect"></select></div>
+            <div class="field"><label>Search Candidate Pool</label><input id="sbPlayerSearch" type="text" placeholder="Search any active player..." /></div>
+          </div>
+        </div>
+
+        <div class="two-col">
+          <div class="card">
+            <div class="card-header">
+              <h3 class="card-title">Pick 5 Starters (<span id="sbSelectedCount">0</span>/5)</h3>
+              <button id="btnSbClearLineup" class="btn btn-sm">Clear</button>
+            </div>
+            <div id="sbSelectedSlots" class="inline-actions" style="margin-bottom:8px;"></div>
+            <div id="sbPoolList" class="pick-list"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-header"><h3 class="card-title">Simulation Results</h3></div>
+            <div class="kpi-grid" id="sbKpiGrid" style="margin-bottom:10px;"></div>
+            <div id="sbSimBanner" class="verdict-banner">Pick 5 players and click <strong>Simulate Lineup</strong>.</div>
+            <div id="sbCommsWarnings" style="margin-top:8px;"></div>
+            <div class="subcard" style="margin-top:10px;">
+              <div class="subcard-title">7-Map Comfort &amp; Likes Comparison</div>
+              <div id="sbMapPoolBars"></div>
+            </div>
+            <div class="subcard" style="margin-top:10px;">
+              <div class="subcard-title">Selected Lineup Breakdown</div>
+              <div class="table-wrap" style="max-height:220px;">
+                <table>
+                  <thead><tr><th>Player</th><th>Age</th><th>Avg</th><th>Languages</th><th>Salary/yr</th><th>IGL / AWP</th></tr></thead>
+                  <tbody id="sbSimRosterBody"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Subtab 2: Growth & Trajectory -->
+      <div id="stSub-stGrowth" class="stsubtab-panel">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">Player Skill Growth &amp; Trajectory Lab</h3>
+              <div class="muted" style="font-size:12px;">Inspect monthly `playerSkillHistories` curves, wonderkids (&le;20), top breakout risers, steepest decliners, and players with untapped potential ceiling.</div>
+            </div>
+            <div class="inline-actions">
+              <label style="font-size:12px;color:var(--text-muted);">Min Months:</label>
+              <input id="grMinMonths" type="number" min="1" max="60" value="2" style="width:68px;" />
+              <button id="btnGrRefresh" class="btn btn-sm btn-primary">Refresh Growth Lab</button>
+            </div>
+          </div>
+          <div class="kpi-grid" id="grKpiGrid"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title" id="grTrajectoryTitle">Player Skill Curve Viewer</h3>
+            <span id="grTrajectoryMeta" class="muted" style="font-size:12px;">Click any row below to inspect month-by-month Mech / Weap / Ment / Overall trajectory</span>
+          </div>
+          <div id="grTrajectoryChart" class="chart-box muted" style="min-height:170px;">No player selected yet.</div>
+        </div>
+
+        <div class="two-col">
+          <div class="card">
+            <div class="card-header"><h3 class="card-title">Top Skill Risers</h3></div>
+            <div class="table-wrap" style="max-height:280px;">
+              <table>
+                <thead><tr><th>Player</th><th>Age</th><th>Team</th><th>Start</th><th>End</th><th>Delta</th></tr></thead>
+                <tbody id="grRisersBody"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-header"><h3 class="card-title">Steepest Decliners</h3></div>
+            <div class="table-wrap" style="max-height:280px;">
+              <table>
+                <thead><tr><th>Player</th><th>Age</th><th>Team</th><th>Start</th><th>End</th><th>Delta</th></tr></thead>
+                <tbody id="grDeclinersBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="two-col">
+          <div class="card">
+            <div class="card-header"><h3 class="card-title">U-20 Wonderkids</h3></div>
+            <div class="table-wrap" style="max-height:280px;">
+              <table>
+                <thead><tr><th>Player</th><th>Age</th><th>Team</th><th>Avg</th><th>Pot</th><th>StartPot</th></tr></thead>
+                <tbody id="grWonderkidsBody"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-header"><h3 class="card-title">Highest Untapped Ceiling</h3></div>
+            <div class="table-wrap" style="max-height:280px;">
+              <table>
+                <thead><tr><th>Player</th><th>Age</th><th>Team</th><th>Avg</th><th>Pot Avg</th><th>Gap</th></tr></thead>
+                <tbody id="grCeilingBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Subtab 3: Market Radar -->
+      <div id="stSub-stMarket" class="stsubtab-panel">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">Live Transfer Market &amp; Vulture Radar</h3>
+              <div class="muted" style="font-size:12px;">Monitors live `personInterests` transfer bids, multi-club vulture swarms, cooldown locks (status 7/8), and hiring-policy violations.</div>
+            </div>
+            <div class="inline-actions">
+              <input id="mrSearchInput" type="text" placeholder="Filter player or club..." />
+              <label class="checkbox-row" style="font-size:12px;"><input id="mrPolicyOnly" type="checkbox" /><span>Policy Violations Only</span></label>
+              <button id="btnMrRefresh" class="btn btn-sm">Refresh Radar</button>
+              <button id="btnMrPurgePolicy" class="btn btn-sm btn-danger">Purge All Policy Violations</button>
+            </div>
+          </div>
+          <div class="kpi-grid" id="mrKpiGrid"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-header"><h3 class="card-title">Vulture Swarms (Most Hunted Players)</h3></div>
+          <div class="table-wrap" style="max-height:300px;">
+            <table>
+              <thead><tr><th>Player</th><th>Age</th><th>Avg</th><th>Current Team</th><th>Clubs</th><th>Active</th><th>Cooldowns</th><th>Policy Bad</th><th>Action</th></tr></thead>
+              <tbody id="mrSwarmsBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="two-col">
+          <div class="card">
+            <div class="card-header"><h3 class="card-title">Active Bids &amp; Shortlists</h3></div>
+            <div class="table-wrap" style="max-height:300px;">
+              <table>
+                <thead><tr><th>Bidder</th><th>Target</th><th>From</th><th>Status</th><th>Score</th><th>Policy</th><th>Action</th></tr></thead>
+                <tbody id="mrActiveBidsBody"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-header"><h3 class="card-title">Club Bidding Aggression</h3></div>
+            <div class="table-wrap" style="max-height:300px;">
+              <table>
+                <thead><tr><th>Club</th><th>Total</th><th>Active</th><th>Cooldowns</th><th>Violations</th><th>Action</th></tr></thead>
+                <tbody id="mrClubsBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Subtab 4: Weapon Meta Lab -->
+      <div id="stSub-stWeapons" class="stsubtab-panel">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">Live Weapon Meta Lab</h3>
+              <div class="muted" style="font-size:12px;">Directly tune CS2 weapon balance (`weapons.weapons`) in your save with instant one-click meta presets or per-gun precision editing.</div>
+            </div>
+            <div class="inline-actions">
+              <button id="btnWpPresetCs2" class="btn btn-sm">CS2 Balanced</button>
+              <button id="btnWpPresetAwp" class="btn btn-sm btn-blue">AWP Era Buff</button>
+              <button id="btnWpPresetRifle" class="btn btn-sm btn-success">Rifle Laser</button>
+              <button id="btnWpPresetEco" class="btn btn-sm btn-primary">Eco / Force Chaos</button>
+            </div>
+          </div>
+          <div class="filter-row">
+            <select id="wpTypeFilter">
+              <option value="">All Weapon Types</option>
+              <option value="0">Pistol</option>
+              <option value="1">SMG</option>
+              <option value="2">Rifle</option>
+              <option value="3">Sniper</option>
+            </select>
+            <input id="wpSearchInput" type="text" placeholder="Filter weapon name..." />
+            <button id="btnWpRefresh" class="btn btn-sm">Reload Weapons</button>
+          </div>
+        </div>
+
+        <div class="split-layout">
+          <div class="card">
+            <div class="table-wrap" style="max-height:60vh;">
+              <table>
+                <thead><tr><th>Weapon</th><th>Type</th><th>Price</th><th>DMG</th><th>Kill $</th><th>Body Shots</th><th>HS Dmg</th></tr></thead>
+                <tbody id="wpTableBody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3 class="card-title" id="wpEditorTitle">Select a Weapon</h3>
+              <button id="btnWpSaveWeapon" class="btn btn-sm btn-primary" disabled>Apply Weapon Tuning</button>
+            </div>
+            <div id="wpComputedStats" class="verdict-banner">Click any gun on the left to edit damage, price, RPM, recoil, and armor penetration.</div>
+            <div class="form-grid" id="wpEditorForm" style="margin-top:10px;">
+              <div class="field"><label>Price ($)</label><input id="wpPrice" type="number" min="0" max="16000" step="50" /></div>
+              <div class="field"><label>Damage</label><input id="wpDamage" type="number" min="1" max="500" /></div>
+              <div class="field"><label>Clip Ammo</label><input id="wpAmmo" type="number" min="1" max="200" /></div>
+              <div class="field"><label>Kill Reward ($)</label><input id="wpKillReward" type="number" min="0" max="2500" step="50" /></div>
+              <div class="field"><label>Reload Time (s)</label><input id="wpReloadTime" type="number" min="1" max="12" /></div>
+              <div class="field"><label>Tier (1-10)</label><input id="wpTier" type="number" min="1" max="10" /></div>
+              <div class="field"><label>HS Multiplier</label><input id="wpHsMult" type="number" min="1" max="10" step="0.1" /></div>
+              <div class="field"><label>Armor Pen Multiplier</label><input id="wpArmorMult" type="number" min="0.1" max="2" step="0.02" /></div>
+              <div class="field"><label>Accuracy (1-100)</label><input id="wpAccuracy" type="number" min="1" max="100" step="0.5" /></div>
+              <div class="field"><label>Move Accuracy Penalty</label><input id="wpMovePenalty" type="number" min="0" max="2" step="0.02" /></div>
+              <div class="field"><label>Recoil / Shot</label><input id="wpRecoilInc" type="number" min="0" max="3" step="0.02" /></div>
+              <div class="field"><label>Recoil Reset (s)</label><input id="wpRecoilReset" type="number" min="0.01" max="2" step="0.02" /></div>
+              <div class="field"><label>Shot Interval (s)</label><input id="wpShotInterval" type="number" min="0.02" max="5" step="0.01" /></div>
+              <div class="field"><label>Distance Drop-Off</label><input id="wpDropOff" type="number" min="0" max="0.2" step="0.002" /></div>
+            </div>
+          </div>
         </div>
       </div>
     </section>
@@ -1637,6 +2218,83 @@
     </div>
   </div>
 
+  <!-- Save Player Relations Manager Modal -->
+  <div class="modal-backdrop" id="relationsModal">
+    <div class="modal modal-xl">
+      <div class="modal-header">
+        <div>
+          <h3 style="margin:0;">Save Player Relations Manager (Friends &amp; Rivals)</h3>
+          <span class="muted" id="relModalSummary" style="font-size:12px;">0 relations in save</span>
+        </div>
+        <button id="btnCloseRelationsModal" class="btn btn-sm">Close</button>
+      </div>
+      <div class="modal-body">
+        <div class="subcard">
+          <div class="subcard-title">Add or Update Relationship Between Any Two Players</div>
+          <div class="form-grid">
+            <div class="field">
+              <label>Filter Player 1</label>
+              <input id="rmP1Search" type="text" placeholder="Search Player 1..." />
+            </div>
+            <div class="field">
+              <label>Player 1</label>
+              <select id="rmP1Select"></select>
+            </div>
+            <div class="field">
+              <label>Filter Player 2</label>
+              <input id="rmP2Search" type="text" placeholder="Search Player 2..." />
+            </div>
+            <div class="field">
+              <label>Player 2</label>
+              <select id="rmP2Select"></select>
+            </div>
+            <div class="field">
+              <label>Relationship Type</label>
+              <select id="rmNewType"></select>
+            </div>
+            <div class="field">
+              <label>Duration (0 = Permanent)</label>
+              <input id="rmNewDuration" type="number" min="0" step="1" value="0" />
+            </div>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-top:8px;">
+            <div class="inline-actions">
+              <label class="checkbox-row"><input id="rmNewP1Resolved" type="checkbox" /><span>P1 Resolved</span></label>
+              <label class="checkbox-row"><input id="rmNewP2Resolved" type="checkbox" /><span>P2 Resolved</span></label>
+            </div>
+            <button id="btnRmAddSave" class="btn btn-primary btn-sm">+ Add / Update Relation</button>
+          </div>
+        </div>
+
+        <div class="filter-row" style="margin-bottom:8px;">
+          <input id="rmFilterQ" type="text" placeholder="Search player, team, or ID..." />
+          <select id="rmFilterType"></select>
+          <select id="rmFilterTeam"></select>
+          <div class="checkbox-row">
+            <input id="rmFilterUnresolved" type="checkbox" />
+            <label for="rmFilterUnresolved">Unresolved Only</label>
+          </div>
+        </div>
+        <div class="table-wrap" style="max-height:420px;">
+          <table>
+            <thead>
+              <tr>
+                <th>Player 1</th>
+                <th>Player 2</th>
+                <th>Type</th>
+                <th>Duration</th>
+                <th>P1 Res</th>
+                <th>P2 Res</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="rmTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Player Deep Stats Modal -->
   <div class="modal-backdrop" id="playerStatsModal">
     <div class="modal modal-xl">
@@ -1670,7 +2328,53 @@
     </div>
   </div>
 
+  <!-- Transfer Vulture Bidders Modal -->
+  <div class="modal-backdrop" id="transferBiddersModal">
+    <div class="modal modal-xl">
+      <div class="modal-header">
+        <div>
+          <h3 id="tbModalTitle" style="margin:0;">Transfer Bidders &amp; Vultures</h3>
+          <div id="tbModalSubtitle" class="muted" style="font-size:12px;margin-top:2px;"></div>
+        </div>
+        <button id="btnCloseTbModal" class="btn btn-sm">Close</button>
+      </div>
+      <div class="modal-body" id="tbModalBody"></div>
+    </div>
+  </div>
+
+  <!-- Command Palette Search Modal -->
+  <div class="modal-backdrop" id="cmdPaletteModal">
+    <div class="modal" style="max-width:740px;">
+      <div class="modal-header">
+        <h3 style="margin:0;">Global Save Search <span class="cmd-kbd">Ctrl+K</span></h3>
+        <button id="btnCloseCmdModal" class="btn btn-sm">Close</button>
+      </div>
+      <div class="modal-body">
+        <input id="cmdSearchInput" type="text" placeholder="Search any player, team, staffer, or tournament..." style="width:100%;margin-bottom:10px;" />
+        <div id="cmdResultsList" class="pick-list" style="max-height:52vh;"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Undo Time Machine Snapshots Modal -->
+  <div class="modal-backdrop" id="snapshotsModal">
+    <div class="modal" style="max-width:760px;">
+      <div class="modal-header">
+        <h3 style="margin:0;">Undo Time Machine Snapshots</h3>
+        <button id="btnCloseSnapshotsModal" class="btn btn-sm">Close</button>
+      </div>
+      <div class="modal-body">
+        <div class="inline-actions" style="margin-bottom:10px;">
+          <input id="snapNewLabel" type="text" placeholder="Checkpoint label (e.g. Before Major Tweaks)" style="flex:1;" />
+          <button id="btnCreateSnapshot" class="btn btn-sm btn-primary">+ Create Checkpoint</button>
+        </div>
+        <div id="snapModalBody"></div>
+      </div>
+    </div>
+  </div>
+
   <div class="toast-stack" id="toastStack"></div>
   <script src="/app.js"></script>
+  <script src="/studio_addons.js"></script>
 </body>
 </html>

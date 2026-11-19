@@ -18,12 +18,13 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import gamedata
-from save_engine import DEFAULT_SAVES_DIR, SaveSession, discover_save_files
+from save_engine import DEFAULT_SAVES_DIR, discover_save_files
+from studio_engine import StudioSession
 
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 
-SESSION = SaveSession()
+SESSION = StudioSession()
 SESSION_LOCK = threading.Lock()
 
 
@@ -97,6 +98,9 @@ def _meta_payload() -> dict[str, Any]:
         "hiringBias": gamedata.HIRING_BIAS,
         "academyFocus": gamedata.ACADEMY_FOCUS,
         "personalityAxes": gamedata.PERSONALITY_AXES,
+        "relationshipTypes": gamedata.RELATIONSHIP_TYPES,
+        "weaponTypes": {0: "Pistol", 1: "SMG", 2: "Rifle", 3: "Sniper"},
+        "awardTypes": {0: "MVP", 1: "Event Win", 2: "EVP", 3: "Top 20"},
     }
 
 
@@ -174,6 +178,51 @@ class EditorRequestHandler(SimpleHTTPRequestHandler):
                     if path == "/api/summary":
                         return self._send_json(HTTPStatus.OK, SESSION.summary())
 
+                    # ---- Studio Snapshots / Search / Career HQ ----
+                    if path == "/api/studio/snapshots":
+                        return self._send_json(HTTPStatus.OK, {"snapshots": SESSION.list_snapshots()})
+
+                    if path == "/api/studio/search":
+                        return self._send_json(HTTPStatus.OK, SESSION.global_search(_qs_str(qs, "q"), _qs_int(qs, "limit", 8)))
+
+                    if path == "/api/studio/career-hq":
+                        return self._send_json(HTTPStatus.OK, SESSION.get_career_hq())
+
+                    # ---- Studio Pro Player & Team Details ----
+                    m = re.fullmatch(r"/api/studio/player/(\d+)", path)
+                    if m:
+                        return self._send_json(HTTPStatus.OK, SESSION.get_player_pro(int(m.group(1))))
+
+                    m = re.fullmatch(r"/api/studio/team/(\d+)", path)
+                    if m:
+                        return self._send_json(HTTPStatus.OK, SESSION.get_team_pro(int(m.group(1))))
+
+                    # ---- Studio Growth Lab ----
+                    if path == "/api/studio/growth":
+                        return self._send_json(HTTPStatus.OK, SESSION.get_growth_lab(min_months=_qs_int(qs, "min_months", 2)))
+
+                    m = re.fullmatch(r"/api/studio/growth/player/(\d+)", path)
+                    if m:
+                        return self._send_json(HTTPStatus.OK, SESSION.get_player_trajectory(int(m.group(1))))
+
+                    # ---- Studio Tournaments Hub & Award Patcher ----
+                    if path == "/api/studio/tournaments":
+                        return self._send_json(HTTPStatus.OK, SESSION.list_tournaments_hub())
+
+                    m = re.fullmatch(r"/api/studio/tournament/(\d+)", path)
+                    if m:
+                        return self._send_json(HTTPStatus.OK, SESSION.get_tournament_hub_detail(int(m.group(1))))
+
+                    # ---- Studio Market Radar / Weapons / Save Diff ----
+                    if path == "/api/studio/market-radar":
+                        return self._send_json(HTTPStatus.OK, SESSION.get_market_radar())
+
+                    if path == "/api/studio/weapons":
+                        return self._send_json(HTTPStatus.OK, SESSION.get_weapons_meta())
+
+                    if path == "/api/studio/diff/saves":
+                        return self._send_json(HTTPStatus.OK, {"saves": SESSION.list_comparable_saves()})
+
                     if path == "/api/players":
                         res = SESSION.list_players(
                             q=_qs_str(qs, "q"),
@@ -187,7 +236,18 @@ class EditorRequestHandler(SimpleHTTPRequestHandler):
 
                     m = re.fullmatch(r"/api/player/(\d+)", path)
                     if m:
-                        return self._send_json(HTTPStatus.OK, SESSION.get_player(int(m.group(1))))
+                        return self._send_json(HTTPStatus.OK, SESSION.get_player_pro(int(m.group(1))))
+
+                    if path == "/api/player-relationships":
+                        return self._send_json(
+                            HTTPStatus.OK,
+                            SESSION.list_player_relationships(
+                                q=_qs_str(qs, "q"),
+                                rel_type=_qs_str(qs, "type"),
+                                team_id=_qs_str(qs, "team_id"),
+                                unresolved_only=_qs_bool(qs, "unresolved_only"),
+                            ),
+                        )
 
                     if path == "/api/staff":
                         res = SESSION.list_staff(
@@ -209,7 +269,7 @@ class EditorRequestHandler(SimpleHTTPRequestHandler):
 
                     m = re.fullmatch(r"/api/team/(\d+)", path)
                     if m:
-                        return self._send_json(HTTPStatus.OK, SESSION.get_team(int(m.group(1))))
+                        return self._send_json(HTTPStatus.OK, SESSION.get_team_pro(int(m.group(1))))
 
                     if path == "/api/transfers":
                         limit = _qs_int(qs, "limit", 80)
@@ -242,6 +302,13 @@ class EditorRequestHandler(SimpleHTTPRequestHandler):
                     m = re.fullmatch(r"/api/stats/match/(\d+)", path)
                     if m:
                         return self._send_json(HTTPStatus.OK, SESSION.get_match_stats_detail(int(m.group(1))))
+
+                    if path == "/api/stats/event":
+                        tid_s = _qs_str(qs, "tournament_id")
+                        return self._send_json(
+                            HTTPStatus.OK,
+                            SESSION.get_event_stats(tournament_id=int(tid_s) if tid_s else None),
+                        )
 
                     if path == "/api/bug-showcase":
                         return self._send_json(HTTPStatus.OK, SESSION.get_bug_showcase())
@@ -336,9 +403,160 @@ class EditorRequestHandler(SimpleHTTPRequestHandler):
                             target_path = str(target_path).strip() or None
                         return self._send_json(HTTPStatus.OK, SESSION.save(target_path=target_path))
 
+                    if path == "/api/backup":
+                        return self._send_json(HTTPStatus.OK, SESSION.create_disk_backup())
+
                     if path == "/api/validate":
                         fix = bool(body.get("fix", False))
                         return self._send_json(HTTPStatus.OK, SESSION.validate_and_fix(fix=fix))
+
+                    # ---- Studio Undo Snapshots ----
+                    if path == "/api/studio/snapshot/create":
+                        return self._send_json(HTTPStatus.OK, SESSION.create_snapshot(str(body.get("label", "Manual Checkpoint"))))
+
+                    if path == "/api/studio/snapshot/restore":
+                        return self._send_json(HTTPStatus.OK, SESSION.restore_snapshot(int(body["id"])))
+
+                    # ---- Studio Career HQ ----
+                    if path == "/api/studio/career-hq/update":
+                        return self._send_json(HTTPStatus.OK, SESSION.update_career_hq(body))
+
+                    if path == "/api/studio/career-hq/switch-team":
+                        return self._send_json(
+                            HTTPStatus.OK,
+                            SESSION.switch_managed_team(int(body["teamId"]), swap_coach=bool(body.get("swapCoach", False))),
+                        )
+
+                    # ---- Studio Player Pro & Team Pro ----
+                    m = re.fullmatch(r"/api/studio/player/(\d+)", path)
+                    if m:
+                        return self._send_json(HTTPStatus.OK, SESSION.update_player_pro(int(m.group(1)), body))
+
+                    m = re.fullmatch(r"/api/studio/player/(\d+)/heal", path)
+                    if m:
+                        return self._send_json(
+                            HTTPStatus.OK,
+                            SESSION.heal_player_state(
+                                int(m.group(1)),
+                                reset_burnout=bool(body.get("resetBurnout", True)),
+                                max_mood=bool(body.get("maxMood", True)),
+                            ),
+                        )
+
+                    m = re.fullmatch(r"/api/studio/player/(\d+)/award/add", path)
+                    if m:
+                        return self._send_json(HTTPStatus.OK, SESSION.add_player_award(int(m.group(1)), body))
+
+                    m = re.fullmatch(r"/api/studio/player/(\d+)/award/delete", path)
+                    if m:
+                        return self._send_json(HTTPStatus.OK, SESSION.delete_player_award(int(m.group(1)), int(body["index"])))
+
+                    m = re.fullmatch(r"/api/studio/team/(\d+)/sponsor", path)
+                    if m:
+                        return self._send_json(HTTPStatus.OK, SESSION.manage_team_sponsor(int(m.group(1)), body))
+
+                    m = re.fullmatch(r"/api/studio/team/(\d+)/heal", path)
+                    if m:
+                        return self._send_json(
+                            HTTPStatus.OK,
+                            SESSION.heal_team_squad(
+                                int(m.group(1)),
+                                reset_burnout=bool(body.get("resetBurnout", True)),
+                                max_mood=bool(body.get("maxMood", True)),
+                                clear_cooldowns=bool(body.get("clearCooldowns", False)),
+                            ),
+                        )
+
+                    # ---- Studio Sandbox ----
+                    if path == "/api/studio/sandbox/simulate":
+                        return self._send_json(
+                            HTTPStatus.OK,
+                            SESSION.simulate_roster(
+                                int(body["teamId"]),
+                                [int(x) for x in (body.get("playerIds") or [])],
+                                vs_team_id=int(body.get("vsTeamId", 0) or 0),
+                            ),
+                        )
+
+                    if path == "/api/studio/sandbox/commit":
+                        return self._send_json(
+                            HTTPStatus.OK,
+                            SESSION.commit_roster_sandbox(
+                                int(body["teamId"]),
+                                [int(x) for x in (body.get("playerIds") or [])],
+                            ),
+                        )
+
+                    # ---- Studio Tournament Hub & Award Patcher ----
+                    m = re.fullmatch(r"/api/studio/tournament/(\d+)/meta", path)
+                    if m:
+                        return self._send_json(HTTPStatus.OK, SESSION.update_tournament_meta(int(m.group(1)), body))
+
+                    m = re.fullmatch(r"/api/studio/tournament/(\d+)/patch-awards", path)
+                    if m:
+                        return self._send_json(
+                            HTTPStatus.OK,
+                            SESSION.patch_tournament_awards(
+                                int(m.group(1)),
+                                mode=str(body.get("mode", "fair")),
+                                custom_player_ids=body.get("customPlayerIds"),
+                                dry_run=bool(body.get("dryRun", False)),
+                            ),
+                        )
+
+                    if path == "/api/studio/tournaments/batch-fair-awards":
+                        return self._send_json(
+                            HTTPStatus.OK,
+                            SESSION.batch_patch_fair_awards(
+                                min_reputation=int(body.get("minReputation", 13) or 13),
+                                dry_run=bool(body.get("dryRun", True)),
+                            ),
+                        )
+
+                    if path == "/api/studio/tournaments/sync-player-awards":
+                        return self._send_json(
+                            HTTPStatus.OK,
+                            SESSION.sync_player_awards_from_tournaments(
+                                dry_run=bool(body.get("dryRun", False)),
+                            ),
+                        )
+
+                    if path == "/api/studio/top20/apply":
+                        return self._send_json(
+                            HTTPStatus.OK,
+                            SESSION.reset_or_recalc_top20(
+                                year=int(body["year"]),
+                                mode=str(body.get("mode", "recalculate")),
+                                vote_player_id=int(body.get("votePlayerId", 0) or 0),
+                                dry_run=bool(body.get("dryRun", False)),
+                            ),
+                        )
+
+                    # ---- Studio Market Radar Actions ----
+                    if path == "/api/studio/market-radar/action":
+                        return self._send_json(
+                            HTTPStatus.OK,
+                            SESSION.clear_market_bids(
+                                mode=str(body.get("mode", "")),
+                                player_id=int(body.get("playerId", 0) or 0),
+                                team_id=int(body.get("teamId", 0) or 0),
+                            ),
+                        )
+
+                    # ---- Studio Weapon Meta Lab ----
+                    m = re.fullmatch(r"/api/studio/weapon/(\d+)", path)
+                    if m:
+                        return self._send_json(HTTPStatus.OK, SESSION.update_weapon(int(m.group(1)), body))
+
+                    if path == "/api/studio/weapons/preset":
+                        return self._send_json(HTTPStatus.OK, SESSION.apply_weapon_preset(str(body.get("preset", ""))))
+
+                    # ---- Studio Save Diff ----
+                    if path == "/api/studio/diff/compare":
+                        bpath = str(body.get("baselinePath", "")).strip()
+                        if not bpath:
+                            raise ValueError("Missing 'baselinePath' in request body.")
+                        return self._send_json(HTTPStatus.OK, SESSION.compare_saves(bpath))
 
                     if path == "/api/players":
                         return self._send_json(HTTPStatus.CREATED, SESSION.create_player(body))
@@ -347,9 +565,11 @@ class EditorRequestHandler(SimpleHTTPRequestHandler):
                         return self._send_json(HTTPStatus.CREATED, SESSION.create_staff(body))
 
                     if path == "/api/transfer/player":
+                        SESSION.create_snapshot("Before Player Transfer")
                         return self._send_json(HTTPStatus.OK, SESSION.transfer_player(body))
 
                     if path == "/api/transfer/staff":
+                        SESSION.create_snapshot("Before Staff Transfer")
                         return self._send_json(HTTPStatus.OK, SESSION.transfer_staff(body))
 
                     m = re.fullmatch(r"/api/player/(\d+)/bench", path)
@@ -361,13 +581,35 @@ class EditorRequestHandler(SimpleHTTPRequestHandler):
                             SESSION.set_player_benched(int(m.group(1)), benched=benched, auto_tactics=auto_tactics),
                         )
 
+                    if path == "/api/player/relationship/save":
+                        return self._send_json(
+                            HTTPStatus.OK,
+                            SESSION.save_player_relationship(
+                                player1_id=int(body["player1Id"]),
+                                player2_id=int(body["player2Id"]),
+                                rel_type=int(body.get("type", 1)),
+                                duration=int(body.get("duration", 0)),
+                                player1_resolved=body.get("player1Resolved"),
+                                player2_resolved=body.get("player2Resolved"),
+                            ),
+                        )
+
+                    if path == "/api/player/relationship/delete":
+                        return self._send_json(
+                            HTTPStatus.OK,
+                            SESSION.delete_player_relationship(
+                                player1_id=int(body["player1Id"]),
+                                player2_id=int(body["player2Id"]),
+                            ),
+                        )
+
                     m = re.fullmatch(r"/api/team/(\d+)/recalculate-tactics", path)
                     if m:
                         return self._send_json(
                             HTTPStatus.OK, SESSION.recalculate_ai_tactics(int(m.group(1)))
                         )
 
-                    if path == "/api/god-mode/apply":
+                    if path in ("/api/god-mode/apply", "/api/god-mode/run"):
                         res = SESSION.run_god_mode(
                             action=str(body.get("action", "")),
                             params=body.get("params") or {},
@@ -380,7 +622,7 @@ class EditorRequestHandler(SimpleHTTPRequestHandler):
                 with SESSION_LOCK:
                     m = re.fullmatch(r"/api/player/(\d+)", path)
                     if m:
-                        return self._send_json(HTTPStatus.OK, SESSION.update_player(int(m.group(1)), body))
+                        return self._send_json(HTTPStatus.OK, SESSION.update_player_pro(int(m.group(1)), body))
 
                     m = re.fullmatch(r"/api/staff/(\d+)", path)
                     if m:
@@ -388,13 +630,14 @@ class EditorRequestHandler(SimpleHTTPRequestHandler):
 
                     m = re.fullmatch(r"/api/team/(\d+)", path)
                     if m:
+                        SESSION.create_snapshot(f"Before Team Edit #{m.group(1)}")
                         return self._send_json(HTTPStatus.OK, SESSION.update_team(int(m.group(1)), body))
 
             return self._send_error_json(HTTPStatus.NOT_FOUND, f"Unknown API endpoint: {method} {path}")
 
         except FileNotFoundError as exc:
             return self._send_error_json(HTTPStatus.NOT_FOUND, str(exc))
-        except (KeyError, ValueError, json.JSONDecodeError) as exc:
+        except (KeyError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
             return self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
         except Exception as exc:
             return self._send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, f"{type(exc).__name__}: {exc}")
